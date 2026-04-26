@@ -326,7 +326,8 @@ class InferenceEngine:
         self._eval_transform = self.build_vid_transform_eval()
 
         self.is_loaded = True
-        logger.info(f"Models loaded on {self.device}")
+        mask_mode = "BINARY" if BINARY_MASK else "SOFT (ratio)"
+        logger.info(f"Models loaded on {self.device} | AUD_LEN={AUD_LEN} | Mask mode: {mask_mode}")
 
         # Warm up the model
         self._warmup()

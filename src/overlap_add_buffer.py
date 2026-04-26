@@ -5,33 +5,40 @@ from config import AUD_LEN, AUD_RATE, FRAME_RATE
 
 class OverlapAddBuffer:
     """
-    Overlap-add reconstruction for streaming separation windows.
+    Center-slice extraction with crossfade for streaming separation windows.
 
-    Windows may be written at explicit absolute sample positions so the stream
-    stays sample-accurate even when consecutive inference windows do not land on
-    a perfectly fixed hop.
+    Instead of averaging the full 65536-sample inference window across ~47
+    overlapping calls (which destroys separation quality by blending masks
+    from different video frames), we extract only the center `hop_samples`
+    from each window — the region most accurately described by the current
+    visual context.
+
+    A short cosine crossfade at the splice boundary prevents audible clicks.
     """
 
-    def __init__(self, window_len=AUD_LEN, hop_samples=int(AUD_RATE / FRAME_RATE)):
+    def __init__(
+        self,
+        window_len: int = AUD_LEN,
+        hop_samples: int = int(AUD_RATE / FRAME_RATE),
+        crossfade_len: int = 128,
+    ):
         self.window_len = int(window_len)
         self.hop_samples = int(hop_samples)
+        self.crossfade_len = min(int(crossfade_len), self.hop_samples // 2)
 
-        initial_capacity = self.window_len * 10
-        self.acc = np.zeros(initial_capacity, dtype=np.float64)
-        self.norm = np.zeros(initial_capacity, dtype=np.float64)
+        # Pre-compute crossfade ramps (half-cosine curves)
+        t = np.linspace(0, np.pi / 2, self.crossfade_len, dtype=np.float64)
+        self.fade_in = np.sin(t) ** 2   # 0 → 1
+        self.fade_out = np.cos(t) ** 2   # 1 → 0
 
-        # At SonicSight's tiny streaming hop, rectangular synthesis is the
-        # correct OLA window. A Hann taper would create deep gain valleys.
-        self.synthesis_window = np.ones(self.window_len, dtype=np.float64)
-
-        self.buffer_offset = 0
-        self.next_start_sample = 0
-        self.read_pos = 0
-        self.latest_window_start = None
-        self.max_written_end = 0
+        # State
+        self._prev_tail: np.ndarray | None = None  # tail of previous slice for crossfade
+        self._pcm_queue: list[bytes] = []
+        self.latest_window_start: int | None = None
+        self.next_start_sample: int = 0
 
     def add_window(self, audio_array, start_sample=None):
-        """Add one full inference window at an absolute sample position."""
+        """Add one full inference window; extract the center hop slice."""
         audio_array = np.asarray(audio_array, dtype=np.float64)
 
         if len(audio_array) > self.window_len:
@@ -45,89 +52,61 @@ class OverlapAddBuffer:
         start_sample = int(start_sample)
         if self.latest_window_start is not None and start_sample < self.latest_window_start:
             raise ValueError("OLA windows must be added in non-decreasing sample order.")
-        if start_sample < self.buffer_offset:
-            raise ValueError("Cannot add audio before the compacted OLA buffer start.")
 
-        end_sample = start_sample + self.window_len
-        self._expand_buffers(end_sample)
+        # ── Extract center slice ──
+        center_start = (self.window_len - self.hop_samples) // 2
+        center_end = center_start + self.hop_samples
+        raw_slice = audio_array[center_start:center_end].copy()
 
-        start_idx = start_sample - self.buffer_offset
-        end_idx = start_idx + self.window_len
+        cf = self.crossfade_len
 
-        self.acc[start_idx:end_idx] += audio_array * self.synthesis_window
-        self.norm[start_idx:end_idx] += self.synthesis_window
+        # ── Crossfade with previous tail ──
+        if self._prev_tail is not None and cf > 0:
+            raw_slice[:cf] = (
+                raw_slice[:cf] * self.fade_in
+                + self._prev_tail * self.fade_out
+            )
+
+        # Save this slice's tail for the NEXT crossfade
+        if cf > 0:
+            self._prev_tail = raw_slice[-cf:].copy()
+            # Emit everything EXCEPT the tail (it will be blended into the next slice)
+            emit_slice = raw_slice[:-cf]
+        else:
+            self._prev_tail = None
+            emit_slice = raw_slice
+
+        # Convert to PCM16 and queue
+        pcm_bytes = (
+            (np.clip(emit_slice, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
+        )
+        self._pcm_queue.append(pcm_bytes)
 
         self.latest_window_start = start_sample
-        self.max_written_end = max(self.max_written_end, end_sample)
         self.next_start_sample = start_sample + self.hop_samples
 
     def drain(self):
         """
-        Drain the committed PCM16 region.
+        Return all queued PCM16 bytes and clear the queue.
 
-        Once a new window arrives, everything strictly before that window's
-        start sample is final and can be emitted safely.
+        Each call to `add_window` queues one center-slice worth of audio.
+        The caller should send the drained bytes to the client immediately.
         """
-        if self.latest_window_start is None:
+        if not self._pcm_queue:
             return b""
-        return self._drain_until(self.latest_window_start)
+        result = b"".join(self._pcm_queue)
+        self._pcm_queue.clear()
+        return result
 
     def flush(self):
-        """Drain the remaining tail after the stream ends."""
-        return self._drain_until(self.max_written_end)
-
-    def _drain_until(self, drain_pos):
-        drain_pos = int(drain_pos)
-        if self.read_pos >= drain_pos:
-            return b""
-
-        start_idx = self.read_pos - self.buffer_offset
-        end_idx = drain_pos - self.buffer_offset
-
-        chunk_acc = self.acc[start_idx:end_idx]
-        chunk_norm = self.norm[start_idx:end_idx]
-
-        safe_norm = np.where(chunk_norm > 1e-10, chunk_norm, 1.0)
-        normalized_audio = chunk_acc / safe_norm
-        pcm_bytes = (
-            (np.clip(normalized_audio, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
-        )
-
-        self.read_pos = drain_pos
-        self._compact()
-        return pcm_bytes
-
-    def _expand_buffers(self, min_end_sample):
-        required_size = min_end_sample - self.buffer_offset
-        if required_size <= len(self.acc):
-            return
-
-        new_size = len(self.acc)
-        while required_size > new_size:
-            new_size *= 2
-
-        new_acc = np.zeros(new_size, dtype=np.float64)
-        new_norm = np.zeros(new_size, dtype=np.float64)
-        new_acc[: len(self.acc)] = self.acc
-        new_norm[: len(self.norm)] = self.norm
-
-        self.acc = new_acc
-        self.norm = new_norm
-
-    def _compact(self):
-        consumed = self.read_pos - self.buffer_offset
-        if consumed <= 0:
-            return
-
-        threshold = max(self.window_len, len(self.acc) // 4)
-        if consumed < threshold:
-            return
-
-        valid_len = len(self.acc) - consumed
-        self.acc[:valid_len] = self.acc[consumed:]
-        self.acc[valid_len:] = 0.0
-
-        self.norm[:valid_len] = self.norm[consumed:]
-        self.norm[valid_len:] = 0.0
-
-        self.buffer_offset += consumed
+        """Drain the remaining crossfade tail after the stream ends."""
+        tail_pcm = b""
+        if self._prev_tail is not None and len(self._prev_tail) > 0:
+            # Fade out the final tail to silence
+            faded_tail = self._prev_tail * self.fade_out
+            tail_pcm = (
+                (np.clip(faded_tail, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
+            )
+            self._prev_tail = None
+        queued = self.drain()
+        return queued + tail_pcm

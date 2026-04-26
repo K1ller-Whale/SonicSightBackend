@@ -140,6 +140,15 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                 if len(left_pcm) != len(right_pcm):
                     raise RuntimeError("Left/right OLA drains returned mismatched PCM lengths.")
 
+                # Diagnostic: log audio levels periodically
+                if cycles_processed % 10 == 0 and len(left_pcm) > 0:
+                    left_samples = np.frombuffer(left_pcm, dtype=np.int16)
+                    logger.info(
+                        f"Audio drain: {len(left_samples)} samples, "
+                        f"max_amp={np.max(np.abs(left_samples))}, "
+                        f"rms={np.sqrt(np.mean(left_samples.astype(np.float64)**2)):.1f}"
+                    )
+
                 # 6. Stream back the result
                 # OPTIMIZATION: Quantize heatmap to uint8 (0-255) to save 4x bandwidth
                 # OPTIMIZATION: Stop sending center_frame_jpeg, mobile will use local cache
