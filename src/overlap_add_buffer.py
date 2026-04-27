@@ -37,8 +37,18 @@ class OverlapAddBuffer:
         self.latest_window_start: int | None = None
         self.next_start_sample: int = 0
 
-    def add_window(self, audio_array, start_sample=None):
-        """Add one full inference window; extract the center hop slice."""
+    def add_window(self, audio_array, start_sample=None, center_offset=None):
+        """Add one full inference window; extract the center hop slice.
+
+        Args:
+            audio_array: Float64 inference output (65536 samples).
+            start_sample: Absolute sample position for ordering.
+            center_offset: If provided, overrides the default center-slice
+                position.  Used during early inference when the real audio
+                occupies only the *start* of the window (the rest is zero-
+                padded) so the extraction point must be shifted left to land
+                inside the real audio region.
+        """
         audio_array = np.asarray(audio_array, dtype=np.float64)
 
         if len(audio_array) > self.window_len:
@@ -54,9 +64,15 @@ class OverlapAddBuffer:
             raise ValueError("OLA windows must be added in non-decreasing sample order.")
 
         # ── Extract center slice ──
-        center_start = (self.window_len - self.hop_samples) // 2
-        center_end = center_start + self.hop_samples
-        raw_slice = audio_array[center_start:center_end].copy()
+        if center_offset is not None:
+            # Early inference: extract from the specified offset instead of
+            # the mathematical center.  Clamp so we never read past the end.
+            cs = max(0, min(center_offset, self.window_len - self.hop_samples))
+        else:
+            cs = (self.window_len - self.hop_samples) // 2
+
+        center_end = cs + self.hop_samples
+        raw_slice = audio_array[cs:center_end].copy()
 
         cf = self.crossfade_len
 

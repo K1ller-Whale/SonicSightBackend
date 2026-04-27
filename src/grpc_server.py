@@ -48,6 +48,7 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
         chunks_received = 0
         last_yielded_timestamp = -1
         cycles_processed = 0
+        seq_number = 0
 
         try:
             async for chunk in request_iterator:
@@ -132,8 +133,23 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                     )
                     continue
 
-                left_ola.add_window(result["left_audio"], start_sample=window_start_sample)
-                right_ola.add_window(result["right_audio"], start_sample=window_start_sample)
+                # Determine center-slice extraction offset.
+                # In early inference mode the real audio sits at the START of the
+                # 65536-sample window (the rest is zero-padded).  We tell the OLA
+                # buffer to extract from a position that falls inside the real audio,
+                # rather than the mathematical center of the window.
+                ola_center_offset = None
+                if getattr(buffer, '_last_window_mode', 'normal') == 'early':
+                    early_len = getattr(buffer, '_last_early_audio_len', 0)
+                    hop = left_ola.hop_samples
+                    if early_len > hop:
+                        # Place extraction in the center of the real audio portion
+                        ola_center_offset = max(0, (early_len - hop) // 2)
+                    else:
+                        ola_center_offset = 0
+
+                left_ola.add_window(result["left_audio"], start_sample=window_start_sample, center_offset=ola_center_offset)
+                right_ola.add_window(result["right_audio"], start_sample=window_start_sample, center_offset=ola_center_offset)
                 left_pcm = left_ola.drain()
                 right_pcm = right_ola.drain()
 
@@ -171,8 +187,11 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                     center_frame_jpeg=b"", # Empty to save bandwidth
                     inference_time_ms=inf_time,
                     post_processing_time_ms=post_time,
-                    total_server_time_ms=total_cycle_time
+                    total_server_time_ms=total_cycle_time,
+                    sequence_number=seq_number,
+                    audio_sample_count=len(left_pcm) // 2,  # PCM16 = 2 bytes per sample
                 )
+                seq_number += 1
 
                 last_yielded_timestamp = center_timestamp
                 # Throttle per-cycle logs: reduce console I/O overhead and only
@@ -369,8 +388,10 @@ async def serve(port=50051):
         options=[
             ("grpc.max_receive_message_length", 16 * 1024 * 1024),  # 16MB
             ("grpc.max_send_message_length", 16 * 1024 * 1024),     # 16MB
-            # Disable compression for low-latency streaming
-            ("grpc.default_compression_algorithm", grpc.Compression.NoCompression),
+            # Enable gzip compression — reduces payload size by 30-50% on
+            # degraded networks at the cost of ~1ms CPU overhead per message.
+            ("grpc.default_compression_algorithm", 2),  # 2 = gzip
+            ("grpc.default_compression_level", 1),  # 1 = low (fastest)
         ]
     )
     sonicsight_pb2_grpc.add_SonicSightServiceServicer_to_server(

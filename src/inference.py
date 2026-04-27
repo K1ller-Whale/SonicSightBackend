@@ -137,9 +137,13 @@ class StreamingBuffer:
         except Exception as e:
             logger.info(f"Error decoding frame: {e}")
 
+    # Minimum audio to start early inference (1 second = 11025 samples).
+    # Below this the spectrogram is too empty for any meaningful separation.
+    EARLY_INFERENCE_MIN_SAMPLES = AUD_RATE  # 11025 = 1 second
+
     def has_enough_data(self):
         """Checks if we have basic minimum requirements to even attempt finding a window."""
-        if self.total_audio_samples < self.target_audio_len:
+        if self.total_audio_samples < self.EARLY_INFERENCE_MIN_SAMPLES:
             return False
         if len(self.frame_buffer) < NUM_FRAMES:
             return False
@@ -148,11 +152,95 @@ class StreamingBuffer:
     def get_latest_window(self):
         """
         Returns the most recent valid window for inference:
-        - 65535 samples of audio
+        - 65536 samples of audio (zero-padded if in early mode)
         - 3 frames centered precisely in the audio stream
+
+        Sets self._last_window_mode to:
+          'early'  — audio was zero-padded (< target_audio_len available)
+          'normal' — full audio window available
+
+        In early mode, also sets self._last_early_audio_len to the number of
+        real (non-zero-padded) samples, so the caller can adjust the OLA
+        center-slice extraction point.
         """
         if not self.has_enough_data():
             return None, None, None, None
+
+        available_samples = self.total_audio_samples
+        is_early = available_samples < self.target_audio_len
+
+        if is_early:
+            # ── EARLY INFERENCE MODE ──
+            # Use ALL available audio, zero-pad to target_audio_len.
+            # Place real audio at the START of the window.
+            if len(self.audio_chunks) > 1:
+                flat_audio = np.concatenate(self.audio_chunks)
+                self.audio_chunks = [flat_audio]
+            else:
+                flat_audio = self.audio_chunks[0]
+
+            real_audio = flat_audio[:available_samples].copy()
+            audio_window = np.zeros(self.target_audio_len, dtype=np.float32)
+            audio_window[:len(real_audio)] = real_audio
+
+            # Use the latest 3 frames as visual context
+            # (we guaranteed >= NUM_FRAMES in has_enough_data)
+            valid_center_idx = len(self.frame_buffer) - 2
+            if valid_center_idx < 1:
+                valid_center_idx = 1
+            if valid_center_idx >= len(self.frame_buffer) - 1:
+                valid_center_idx = len(self.frame_buffer) - 2
+
+            left_frames = [
+                self.frame_buffer[valid_center_idx - 1]["left_img"],
+                self.frame_buffer[valid_center_idx]["left_img"],
+                self.frame_buffer[valid_center_idx + 1]["left_img"],
+            ]
+            right_frames = [
+                self.frame_buffer[valid_center_idx - 1]["right_img"],
+                self.frame_buffer[valid_center_idx]["right_img"],
+                self.frame_buffer[valid_center_idx + 1]["right_img"],
+            ]
+            frames_tuple = (left_frames, right_frames)
+
+            center_timestamp = self.frame_buffer[valid_center_idx]["timestamp_ms"]
+
+            # Use audio_base_sample as the absolute start
+            absolute_window_start_sample = self.audio_base_sample
+
+            # Guard against non-monotonic windows
+            if (
+                self.last_processed_window_start_sample >= 0
+                and absolute_window_start_sample
+                <= self.last_processed_window_start_sample
+            ):
+                return None, None, None, None
+
+            self.last_processed_timestamp_ms = center_timestamp
+            self.last_processed_window_start_sample = absolute_window_start_sample
+
+            # Communicate early-mode metadata to the caller
+            self._last_window_mode = "early"
+            self._last_early_audio_len = len(real_audio)
+
+            logger.info(
+                "Early inference: %d/%d samples (%.1f%% real), ts=%dms",
+                len(real_audio),
+                self.target_audio_len,
+                100.0 * len(real_audio) / self.target_audio_len,
+                center_timestamp,
+            )
+
+            return (
+                audio_window,
+                frames_tuple,
+                int(center_timestamp),
+                absolute_window_start_sample,
+            )
+
+        # ── NORMAL MODE ── (existing logic)
+        self._last_window_mode = "normal"
+        self._last_early_audio_len = 0
 
         half_audio_ms = ((self.target_audio_len / 2) / self.target_sr) * 1000.0
         current_audio_end_ms = (
