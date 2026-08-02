@@ -27,7 +27,19 @@ from config import (
     LOG_FREQ,
     BINARY_MASK,
     MASK_THRES,
+    MASK_RENORM,
+    MASK_RENORM_FLOOR,
+    MASK_RENORM_EPS,
+    AUDIO_NORM,
+    AUDIO_NORM_TARGET_RMS,
+    AUDIO_NORM_MAX_GAIN,
+    AUDIO_NORM_MIN_RMS,
+    AUDIO_NORM_SMOOTH,
+    STREAM_DUMP,
     IMG_POOL,
+    SEPARATION_MODE,
+    SEP_TOPK,
+    MASK_SMOOTH,
     CKPT_ROOT,
 )
 import utils.video_transforms as vtransforms
@@ -415,7 +427,22 @@ class InferenceEngine:
 
         self.is_loaded = True
         mask_mode = "BINARY" if BINARY_MASK else "SOFT (ratio)"
+        if MASK_RENORM:
+            mask_mode += f" +renorm(floor={MASK_RENORM_FLOOR})"
+        if AUDIO_NORM:
+            mask_mode += (
+                f" | input rms -> {AUDIO_NORM_TARGET_RMS}"
+                f" (max {AUDIO_NORM_MAX_GAIN}x, smooth {AUDIO_NORM_SMOOTH})"
+            )
+        if SEPARATION_MODE == "pixel":
+            sep_desc = f"PIXEL-level (top-{SEP_TOPK} activation pixels)"
+        else:
+            sep_desc = f"VIDEO-level ({IMG_POOL}) [legacy]"
+        smooth_desc = (
+            f"EMA {MASK_SMOOTH}" if 0.0 < MASK_SMOOTH < 1.0 else "off"
+        )
         logger.info(f"Models loaded on {self.device} | AUD_LEN={AUD_LEN} | Mask mode: {mask_mode}")
+        logger.info(f"Separation conditioning: {sep_desc} | mask smoothing: {smooth_desc}")
 
         # Warm up the model
         self._warmup()
@@ -433,6 +460,47 @@ class InferenceEngine:
             self.net_synth(feat_frame, feat_sound)
         logger.info("Warm-up complete.")
 
+    def _audio_norm_gain(self, y_segment, smooth=False):
+        """Gain that brings this window to AUDIO_NORM_TARGET_RMS.
+
+        The network is not scale invariant, and a quiet capture sits well
+        outside the level its batch-norm statistics were trained on. Scaling
+        the input is exactly invertible: the masks are ratios and the phase is
+        untouched, so dividing the reconstruction by the same gain returns the
+        original level with no colouration.
+
+        In the streaming path the gain is smoothed across windows. Giving each
+        overlap-add window its own gain would make the masks jump at every
+        seam, which is audible as pumping.
+        """
+        if not AUDIO_NORM:
+            return 1.0
+
+        y = np.asarray(y_segment, dtype=np.float64)
+        if y.size == 0:
+            return 1.0
+
+        rms = float(np.sqrt(np.mean(np.square(y))))
+        if not np.isfinite(rms) or rms < AUDIO_NORM_MIN_RMS:
+            # Silence. Leave it alone rather than amplify the noise floor.
+            return 1.0
+
+        gain = AUDIO_NORM_TARGET_RMS / rms
+        gain = float(
+            np.clip(gain, 1.0 / AUDIO_NORM_MAX_GAIN, AUDIO_NORM_MAX_GAIN)
+        )
+
+        if smooth:
+            prev = getattr(self, "_norm_gain_ema", None)
+            if prev is None:
+                self._norm_gain_ema = gain
+            else:
+                a = float(np.clip(AUDIO_NORM_SMOOTH, 0.0, 1.0))
+                self._norm_gain_ema = (1.0 - a) * prev + a * gain
+            gain = self._norm_gain_ema
+
+        return gain
+
     def prepare_audio(self, audio_path):
         y, sr = librosa.load(audio_path, sr=AUD_RATE, mono=True)
         if y.size == 0:
@@ -446,8 +514,14 @@ class InferenceEngine:
         end = start + AUD_LEN
         y_segment = y[start:end]
 
+        # Bring the window to the level the network was trained at. One-shot
+        # path, so no smoothing.
+        audio_gain = self._audio_norm_gain(y_segment, smooth=False)
+
         # Use GPU STFT for consistency and speed
         y_torch = torch.from_numpy(y_segment).to(self.device).float()
+        if audio_gain != 1.0:
+            y_torch = y_torch * audio_gain
         window = self.hann_window
         stft = torch.stft(
             y_torch,
@@ -464,7 +538,7 @@ class InferenceEngine:
         mag_lin_torch = mag.unsqueeze(0).unsqueeze(0)
         phase_np = torch.angle(stft).cpu().numpy()
 
-        return mag_lin_torch, phase_np, y_segment
+        return mag_lin_torch, phase_np, y_segment, audio_gain
 
     def prepare_audio_from_buffer(self, y_segment):
         """Prepare STFT using Torch on GPU for maximum speed."""
@@ -474,8 +548,14 @@ class InferenceEngine:
             else:
                 y_segment = y_segment[:AUD_LEN]
 
+        # Bring the window to the level the network was trained at. Streaming
+        # path, so the gain is smoothed across consecutive windows.
+        audio_gain = self._audio_norm_gain(y_segment, smooth=True)
+
         # Move raw audio to GPU
         y_torch = torch.from_numpy(y_segment).to(self.device).float()
+        if audio_gain != 1.0:
+            y_torch = y_torch * audio_gain
 
         # Use Torch STFT (GPU accelerated)
         window = self.hann_window
@@ -496,7 +576,7 @@ class InferenceEngine:
         mag_lin_torch = mag.unsqueeze(0).unsqueeze(0)  # [1, 1, 512, 256]
         phase_np = torch.angle(stft).cpu().numpy()
 
-        return mag_lin_torch, phase_np, y_segment
+        return mag_lin_torch, phase_np, y_segment, audio_gain
 
     def build_vid_transform_eval(self):
         mean = [0.485, 0.456, 0.406]
@@ -580,7 +660,9 @@ class InferenceEngine:
             right_frames[center_idx],
         )
 
-    def logic_separate_audio(self, mag_lin_torch, phase_np, frames_left, frames_right):
+    def logic_separate_audio(
+        self, mag_lin_torch, phase_np, frames_left, frames_right, audio_gain=1.0
+    ):
         with torch.no_grad():
             B, _, HS, T_lin = mag_lin_torch.size()
             mag_for_net = mag_lin_torch
@@ -613,13 +695,30 @@ class InferenceEngine:
                 ]
 
             mag_lin_np = mag_lin_torch.squeeze().cpu().numpy()
+
+            # Renormalize across BOTH masks before reconstructing either one,
+            # so the pair partitions the mixture's energy. This must happen
+            # outside the per-mask loop, and must match eval_stream_window
+            # exactly or the file and streaming paths will diverge.
+            pm_nps = [pm.squeeze().cpu().numpy() for pm in pred_masks]
+            if MASK_RENORM:
+                pm_sum = np.clip(
+                    np.sum(pm_nps, axis=0),
+                    max(MASK_RENORM_FLOOR, MASK_RENORM_EPS),
+                    None,
+                )
+                pm_nps = [pm_np / pm_sum for pm_np in pm_nps]
+
             wavs = []
-            for pm in pred_masks:
-                pm_np = pm.squeeze().cpu().numpy()
+            for pm_np in pm_nps:
                 if BINARY_MASK:
                     pm_np = (pm_np > MASK_THRES).astype(np.float32)
                 pred_mag = mag_lin_np * pm_np
                 wav = istft_reconstruction(pred_mag, phase_np, hop_length=STFT_HOP)
+                # Undo the input normalization so the caller gets the original
+                # level back.
+                if audio_gain != 1.0:
+                    wav = wav / audio_gain
                 wavs.append(np.clip(wav, -1.0, 1.0))
 
         return wavs
@@ -865,9 +964,12 @@ class InferenceEngine:
                 )
                 with amp_ctx:
                     # 1. Prepare Data
-                    mag_lin_torch, phase_np, _ = self.prepare_audio_from_buffer(
-                        audio_array
-                    )
+                    (
+                        mag_lin_torch,
+                        phase_np,
+                        _,
+                        audio_gain,
+                    ) = self.prepare_audio_from_buffer(audio_array)
 
                     left_frames, right_frames = frames_tuple
                     transform = self._eval_transform
@@ -896,33 +998,138 @@ class InferenceEngine:
                     )
 
                     # --- C. AUDIO SEPARATION ---
-                    def pool_vision(x):
-                        B = x.size(0)
-                        if IMG_POOL == "avgpool":
-                            return F.adaptive_avg_pool3d(x, 1).view(B, -1)
-                        else:
-                            return F.adaptive_max_pool3d(x, 1).view(B, -1)
-
-                    feat_vision_pooled = activate(
-                        pool_vision(feats_video), "sigmoid"
-                    )  # [2, C_feat]
                     feat_sound_expanded = feat_sound.expand(
                         2, -1, -1, -1
                     )  # Broadcast audio parameters for both images
 
-                    pred_mask = activate(
-                        self.net_synth(feat_vision_pooled, feat_sound_expanded),
-                        "sigmoid",
-                    )
+                    # Cached for the heatmap stage further down, so the expensive
+                    # forward_pixelwise call happens exactly once per cycle.
+                    cached_spatial_act = None
+
+                    if SEPARATION_MODE == "pixel":
+                        # ------------------------------------------------------
+                        # PIXEL-LEVEL CONDITIONING (paper Section 3.3, test-time)
+                        #
+                        # The previous code used adaptive_max_pool3d to collapse
+                        # T, H and W into ONE 32-d vector per crop, then sigmoid.
+                        # Taking the max over 3x14x14 = 588 positions saturates
+                        # nearly every channel, so both crops - each just "a
+                        # musician in a room" - produced almost the same vector
+                        # (measured cosine similarity 0.85 to 0.98).
+                        #
+                        # The synthesizer is a plain inner product with scale ~= 1
+                        # (measured min 0.971, max 1.052), so near-identical vision
+                        # vectors give near-identical masks. After renormalisation
+                        # that is a 50/50 split: both instruments in both channels.
+                        #
+                        # Instead, condition on the most sound-active PIXELS of
+                        # each crop, which is what the paper prescribes at test
+                        # time. forward_pixelwise gives the mask at every pixel;
+                        # we pick the top-K by activation and average them.
+                        # ------------------------------------------------------
+                        feats_img_px = feats_video.max(dim=2)[0]  # [2, C, HI, WI]
+                        feats_img_px = activate(feats_img_px, "sigmoid")
+
+                        px_ctx = (
+                            torch.amp.autocast(device_type="cuda", enabled=False)
+                            if self.device.type == "cuda"
+                            else nullcontext()
+                        )
+                        with px_ctx:
+                            z_px = self.net_synth.forward_pixelwise(
+                                feats_img_px.float(),
+                                feat_sound_expanded.float(),
+                            )  # [2, HI, WI, HS, WS]
+                            mask_px = torch.sigmoid(z_px)
+
+                            # Spatial activation = how much sound this pixel claims.
+                            # This is exactly the heatmap, so cache it for reuse.
+                            spatial_act = mask_px.mean(dim=(3, 4))  # [2, HI, WI]
+                            cached_spatial_act = spatial_act
+
+                            B_px, HI_px, WI_px = spatial_act.shape
+                            HS_px, WS_px = mask_px.shape[3], mask_px.shape[4]
+
+                            act_flat = spatial_act.reshape(B_px, -1)
+                            k = int(max(1, min(SEP_TOPK, act_flat.shape[1])))
+                            top_v, top_i = act_flat.topk(k, dim=1)  # [2, k]
+
+                            mask_flat = mask_px.reshape(
+                                B_px, HI_px * WI_px, HS_px, WS_px
+                            )
+                            gather_idx = top_i.view(B_px, k, 1, 1).expand(
+                                -1, -1, HS_px, WS_px
+                            )
+                            sel = mask_flat.gather(1, gather_idx)  # [2, k, HS, WS]
+
+                            # Activation-weighted average of the top-K pixel masks.
+                            w = top_v / top_v.sum(dim=1, keepdim=True).clamp_min(1e-8)
+                            pred_mask = (sel * w.view(B_px, k, 1, 1)).sum(dim=1)
+                            pred_mask = pred_mask.unsqueeze(1)  # [2, 1, HS, WS]
+
+                            del mask_px, z_px, mask_flat, sel
+                    else:
+                        # Legacy video-level pooling (the paper's TRAIN-time mode).
+                        def pool_vision(x):
+                            B = x.size(0)
+                            if IMG_POOL == "avgpool":
+                                return F.adaptive_avg_pool3d(x, 1).view(B, -1)
+                            else:
+                                return F.adaptive_max_pool3d(x, 1).view(B, -1)
+
+                        feat_vision_pooled = activate(
+                            pool_vision(feats_video), "sigmoid"
+                        )  # [2, C_feat]
+
+                        pred_mask = activate(
+                            self.net_synth(feat_vision_pooled, feat_sound_expanded),
+                            "sigmoid",
+                        )
 
                     # Unwarp
                     grid_unwarp_expanded = self.grid_unwarp.expand(2, -1, -1, -1)
                     pred_mask = F.grid_sample(
-                        pred_mask, grid_unwarp_expanded, align_corners=True
+                        pred_mask.to(mag_lin_torch.dtype),
+                        grid_unwarp_expanded,
+                        align_corners=True,
                     )
 
                     # --- AUDIO RECONSTRUCTION ON GPU ---
                     pm_torch = pred_mask.squeeze(1)  # [2, HS, T]
+
+                    # --- MASK RENORMALIZATION ---
+                    # Ratio masks must partition the mixture: maskL + maskR = 1
+                    # at every T-F bin. Two independent sigmoids do not
+                    # guarantee that, and when they undershoot, the output
+                    # loses nearly all of its energy.
+                    #
+                    # This cannot amplify anything: m_i / (m_L + m_R) is in
+                    # [0, 1] by construction, so each output bin is at most the
+                    # mixture bin and the pair sums to exactly the mixture. The
+                    # epsilon only guards 0/0 in digitally silent bins.
+                    # --- MASK TEMPORAL SMOOTHING ---
+                    # Consecutive windows overlap by 97.9% (hop 1378 of 65536),
+                    # so their audio content is virtually identical and their
+                    # masks should be too. They are computed independently and
+                    # flicker, and overlap-add of flickering masks is exactly
+                    # what a robotic / warbling artifact sounds like. An EMA
+                    # across windows removes the flicker without adding latency.
+                    if 0.0 < MASK_SMOOTH < 1.0:
+                        prev_mask = getattr(self, "_mask_ema", None)
+                        if prev_mask is None or prev_mask.shape != pm_torch.shape:
+                            self._mask_ema = pm_torch.clone()
+                        else:
+                            self._mask_ema = (
+                                MASK_SMOOTH * pm_torch
+                                + (1.0 - MASK_SMOOTH) * prev_mask
+                            )
+                        pm_torch = self._mask_ema
+
+                    if MASK_RENORM:
+                        pm_sum = pm_torch.sum(dim=0, keepdim=True)
+                        pm_torch = pm_torch / torch.clamp(
+                            pm_sum, min=max(MASK_RENORM_FLOOR, MASK_RENORM_EPS)
+                        )
 
                     # Apply Binary Mask if configured (now on GPU)
                     if BINARY_MASK:
@@ -951,13 +1158,14 @@ class InferenceEngine:
                         length=AUD_LEN,
                     )
 
+                    # Undo the input normalization so playback level matches
+                    # the microphone level.
+                    if audio_gain != 1.0:
+                        wav_torch = wav_torch / audio_gain
+
                     # --- D. VISUAL HEATMAPS ---
                     # Fast batched heatmaps using already computed features to keep
                     # per-cycle latency under real-time streaming budget.
-                    feats_img, _ = feats_video.max(dim=2)  # [2, C, HI, WI]
-                    feats_img = activate(feats_img, "sigmoid")
-                    feat_sound_for_heatmap = feat_sound.expand(2, -1, -1, -1)
-
                     # Keep heatmap branch in full fp32 to avoid underflow/saturation artifacts.
                     heatmap_ctx = (
                         torch.amp.autocast(device_type="cuda", enabled=False)
@@ -965,14 +1173,28 @@ class InferenceEngine:
                         else nullcontext()
                     )
                     with heatmap_ctx:
-                        z = self.net_synth.forward_pixelwise(
-                            feats_img.float(),
-                            feat_sound_for_heatmap.float(),
-                        )  # [2, HI, WI, HS, WS]
-                        # Sound of Pixels Localization (Section 3.3):
-                        # Sigmoid mask averaged across spectral dims — no magnitude bias.
-                        mask = torch.sigmoid(z)
-                        z_spatial = mask.amax(dim=(3, 4))  # [2, HI, WI]
+                        if cached_spatial_act is not None:
+                            # Pixel-mode separation already computed the pixelwise
+                            # mask and reduced it over the spectral dims. Reuse it
+                            # instead of running forward_pixelwise a second time
+                            # (saves ~103 MB of allocation and a large bmm per cycle).
+                            z_spatial = cached_spatial_act  # [2, HI, WI]
+                        else:
+                            feats_img, _ = feats_video.max(dim=2)  # [2, C, HI, WI]
+                            feats_img = activate(feats_img, "sigmoid")
+                            feat_sound_for_heatmap = feat_sound.expand(2, -1, -1, -1)
+                            z = self.net_synth.forward_pixelwise(
+                                feats_img.float(),
+                                feat_sound_for_heatmap.float(),
+                            )  # [2, HI, WI, HS, WS]
+                            # Sound of Pixels Localization (Section 3.3):
+                            # Sigmoid mask averaged across spectral dims.
+                            # mean (not amax): amax over 256x256 = 65536 sigmoid
+                            # values saturates every pixel to ~1.0 and washes out
+                            # all localization contrast. mean matches /predict.
+                            mask = torch.sigmoid(z)
+                            z_spatial = mask.mean(dim=(3, 4))  # [2, HI, WI]
+                            del mask, z
 
                         # Normalize each side independently
                         B_hm, HI_hm, WI_hm = z_spatial.shape
@@ -983,9 +1205,12 @@ class InferenceEngine:
                         z_norm = torch.where(z_max > 0, z_norm / z_max, z_norm)
                         z_spatial = z_norm.view(B_hm, 1, HI_hm, WI_hm)
 
+                        # FIX: raise resolution from 24x24 to 56x56 to match the
+                        # detail level of the /predict endpoint (224x224). 56x56
+                        # = 3136 bytes/side, still negligible vs gRPC bandwidth.
                         z_up = F.interpolate(
                             z_spatial,
-                            size=(24, 24),
+                            size=(56, 56),
                             mode="bilinear",
                             align_corners=False,
                         )
@@ -1009,6 +1234,28 @@ class InferenceEngine:
             # Perform a generation 0 collection only so it completes instantly and prevents large buildups
             gc.collect(0)
 
+        # Scalars for the streaming diagnostic recorder. Each .item() forces a
+        # GPU sync, so only compute them when the recorder is actually on.
+        diag = None
+        if STREAM_DUMP:
+            try:
+                diag = {
+                    "audio_gain": float(audio_gain),
+                    "mask_mean_left": float(pm_torch[0].float().mean().item()),
+                    "mask_mean_right": float(pm_torch[1].float().mean().item()),
+                    "in_rms": float(
+                        np.sqrt(np.mean(np.square(np.asarray(audio_array, dtype=np.float64))))
+                    ),
+                    "out_rms_left": float(
+                        np.sqrt(np.mean(np.square(wav_final_batch[0].astype(np.float64))))
+                    ),
+                    "out_rms_right": float(
+                        np.sqrt(np.mean(np.square(wav_final_batch[1].astype(np.float64))))
+                    ),
+                }
+            except Exception:
+                diag = None
+
         return {
             "left_audio": wav_final_batch[0],
             "right_audio": wav_final_batch[1],
@@ -1016,6 +1263,7 @@ class InferenceEngine:
             "right_heatmap": heatmap_tensor_batch[1],
             "left_center_frame": pil_left_center,
             "right_center_frame": pil_right_center,
+            "diag": diag,
         }
 
     def eval_for_grpc(self, audio_path, frames_dir, num_frames):
@@ -1031,14 +1279,14 @@ class InferenceEngine:
                 - right_center_frame: PIL Image of the right center frame
         """
         # 1. Prepare Data
-        mag_lin_torch, phase_np, _ = self.prepare_audio(audio_path)
+        mag_lin_torch, phase_np, _, audio_gain = self.prepare_audio(audio_path)
         frames_left, frames_right, pil_left, pil_right = self.prepare_video_inputs(
             frames_dir, num_frames
         )
 
         # 2. Audio Separation
         wavs = self.logic_separate_audio(
-            mag_lin_torch, phase_np, frames_left, frames_right
+            mag_lin_torch, phase_np, frames_left, frames_right, audio_gain=audio_gain
         )
 
         # 3. Visual Heatmaps
@@ -1059,14 +1307,14 @@ class InferenceEngine:
         Generates Left Audio, Right Audio, and Combined Heatmap Image.
         """
         # 1. Prepare Data
-        mag_lin_torch, phase_np, _ = self.prepare_audio(audio_path)
+        mag_lin_torch, phase_np, _, audio_gain = self.prepare_audio(audio_path)
         frames_left, frames_right, pil_left, pil_right = self.prepare_video_inputs(
             frames_dir, num_frames
         )
 
         # 2. Audio Separation
         wavs = self.logic_separate_audio(
-            mag_lin_torch, phase_np, frames_left, frames_right
+            mag_lin_torch, phase_np, frames_left, frames_right, audio_gain=audio_gain
         )
 
         path_aud_left = os.path.join(output_dir, "pred_left.wav")

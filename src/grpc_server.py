@@ -16,7 +16,8 @@ import sonicsight_pb2_grpc
 from inference import inference, StreamingBuffer
 from overlap_add_buffer import OverlapAddBuffer
 from video_preprocessor import VideoPreprocessor
-from config import AUD_RATE
+from config import AUD_RATE, STREAM_DUMP, STREAM_DUMP_DIR
+from stream_dump import StreamDumper
 
 logger = logging.getLogger(__name__)
 
@@ -44,8 +45,22 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
         left_ola = OverlapAddBuffer()
         right_ola = OverlapAddBuffer()
 
+        # Diagnostic recorder (SONICSIGHT_DUMP_STREAM=1). control_ola is fed
+        # the UNSEPARATED input window through the identical overlap-add path,
+        # giving an identity-mask reference: whatever damage the windowing and
+        # stitching do to the audio shows up in control.wav without the model
+        # being involved at all.
+        dumper = None
+        control_ola = None
+        if STREAM_DUMP:
+            session_dir = os.path.join(STREAM_DUMP_DIR, time.strftime("%Y%m%d_%H%M%S"))
+            dumper = StreamDumper(session_dir)
+            control_ola = OverlapAddBuffer()
+            logger.info("STREAM DUMP ENABLED -> %s", session_dir)
+
         # Track processing state
         chunks_received = 0
+        prev_window_start = None
         last_yielded_timestamp = -1
         cycles_processed = 0
         seq_number = 0
@@ -60,6 +75,8 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                     buffer.add_audio_chunk(chunk.audio_pcm, chunk.timestamp_ms)
                     # DEBUG: Check if audio is silent
                     audio_arr = np.frombuffer(chunk.audio_pcm, dtype=np.int16)
+                    if dumper is not None:
+                        dumper.add_mic(chunk.audio_pcm, chunk.timestamp_ms)
                     if chunks_received % 20 == 0:
                         logger.info(f"Incoming audio max amp: {np.max(np.abs(audio_arr))}")
 
@@ -148,6 +165,26 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                     else:
                         ola_center_offset = 0
 
+                # Early-mode windows (zero-padded, low-quality audio, centre placed near
+                # sample 0) must NOT be fed into the OLA buffer. If they were, the next
+                # normal-mode window would drain the entire gap between the early centre
+                # (~0) and the normal centre (~32079) in one shot – a burst of ~26000
+                # samples / 53 KB. The phone JitterBuffer holds only 33 KB, so the write
+                # wraps 1.6x around the ring and corrupts every byte already in it,
+                # producing static for the rest of the session.
+                is_early_mode = getattr(buffer, '_last_window_mode', 'normal') == 'early'
+                if is_early_mode:
+                    # Skip audio output entirely; keep sending buffering status so the
+                    # client stays alive. The heatmap is also low-quality here, so skip.
+                    logger.debug("Skipping OLA add for early-mode window (jitter-overflow guard).")
+                    yield sonicsight_pb2.StreamResult(
+                        success=True,
+                        is_buffering=True,
+                        timestamp_ms=center_timestamp,
+                    )
+                    last_yielded_timestamp = center_timestamp
+                    continue
+
                 left_ola.add_window(result["left_audio"], start_sample=window_start_sample, center_offset=ola_center_offset)
                 right_ola.add_window(result["right_audio"], start_sample=window_start_sample, center_offset=ola_center_offset)
                 left_pcm = left_ola.drain()
@@ -155,6 +192,68 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
 
                 if len(left_pcm) != len(right_pcm):
                     raise RuntimeError("Left/right OLA drains returned mismatched PCM lengths.")
+
+                # Safety net: if a drain is still unexpectedly large (should not happen
+                # after the early-mode guard above, but protects against future regressions)
+                # trim to the newest 1.5 seconds and log loudly so we can investigate.
+                SAFE_DRAIN_SAMPLES = int(AUD_RATE * 1.5)  # 16537 samples = jitter cap
+                if len(left_pcm) // 2 > SAFE_DRAIN_SAMPLES:
+                    logger.warning(
+                        "Oversized OLA drain detected (%d samples > %d cap) – trimming to prevent "
+                        "JitterBuffer overflow. This should not happen; check early-mode logic.",
+                        len(left_pcm) // 2,
+                        SAFE_DRAIN_SAMPLES,
+                    )
+                    left_pcm = left_pcm[-SAFE_DRAIN_SAMPLES * 2:]
+                    right_pcm = right_pcm[-SAFE_DRAIN_SAMPLES * 2:]
+
+                if dumper is not None:
+                    control_ola.add_window(
+                        audio_window,
+                        start_sample=window_start_sample,
+                        center_offset=ola_center_offset,
+                    )
+                    control_pcm = control_ola.drain()
+                    dumper.add_output(left_pcm, right_pcm, control_pcm)
+                    dumper.maybe_dump_window(
+                        cycles_processed,
+                        audio_window,
+                        result["left_audio"],
+                        result["right_audio"],
+                    )
+                    d = result.get("diag") or {}
+                    lh_d = result["left_heatmap"]
+                    dumper.add_cycle(
+                        {
+                            "cycle": cycles_processed,
+                            "seq": seq_number,
+                            "center_ts_ms": center_timestamp,
+                            "window_start_sample": window_start_sample,
+                            "window_delta": (
+                                window_start_sample - prev_window_start
+                                if prev_window_start is not None
+                                else 0
+                            ),
+                            "mode": getattr(buffer, "_last_window_mode", "normal"),
+                            "emitted_samples": len(left_pcm) // 2,
+                            "audio_gain": d.get("audio_gain", 0.0),
+                            "in_rms": d.get("in_rms", 0.0),
+                            "out_rms_left": d.get("out_rms_left", 0.0),
+                            "out_rms_right": d.get("out_rms_right", 0.0),
+                            "mask_mean_left": d.get("mask_mean_left", 0.0),
+                            "mask_mean_right": d.get("mask_mean_right", 0.0),
+                            "heatmap_min": float(lh_d.min()),
+                            "heatmap_max": float(lh_d.max()),
+                            "heatmap_std": float(lh_d.std()),
+                            "gap_fills": left_ola.gap_fills,
+                            "splice_fallbacks": left_ola.splice_fallbacks,
+                            "lagging_windows": left_ola.lagging_windows,
+                            "inference_ms": int(
+                                (inference_end_time - inference_start_time) * 1000
+                            ),
+                        }
+                    )
+                    prev_window_start = window_start_sample
 
                 # Diagnostic: log audio levels periodically
                 if cycles_processed % 10 == 0 and len(left_pcm) > 0:
@@ -209,6 +308,10 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
 
             final_left_pcm = left_ola.flush()
             final_right_pcm = right_ola.flush()
+            if dumper is not None:
+                dumper.add_output(
+                    final_left_pcm, final_right_pcm, control_ola.flush()
+                )
             if final_left_pcm or final_right_pcm:
                 if len(final_left_pcm) != len(final_right_pcm):
                     raise RuntimeError("Left/right OLA flush returned mismatched PCM lengths.")
@@ -241,6 +344,20 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                 success=False,
                 error_message=str(e),
             )
+        finally:
+            if dumper is not None:
+                summary = dumper.close(
+                    {
+                        "chunks_received": chunks_received,
+                        "cycles_processed": cycles_processed,
+                        "session_seconds": round(time.time() - start_process_time, 2),
+                        "ola_gap_fills": left_ola.gap_fills,
+                        "ola_splice_fallbacks": left_ola.splice_fallbacks,
+                        "ola_lagging_windows": left_ola.lagging_windows,
+                        "ola_total_emitted": left_ola.total_emitted,
+                    }
+                )
+                logger.info("STREAM DUMP WRITTEN: %s", summary)
 
     async def ProcessVideo(self, request_iterator, context):
         request_id = uuid4().hex

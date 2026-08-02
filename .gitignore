@@ -5,3 +5,5 @@ __pycache__/
 **/ckpt/*.pth
 **/outputs/*/
 **/testing_model/*/
+/diag5_audio/
+*.txt
