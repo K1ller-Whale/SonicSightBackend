@@ -72,7 +72,7 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
         # Initialize streaming buffer for this connection, shaped by the spec
         buffer = StreamingBuffer(
             target_audio_len=spec.window_samples,
-            target_sr=spec.model_sample_rate,
+            target_sr=spec.capture_sample_rate,
             num_frames=spec.num_frames,
             frame_ring_cap=spec.frame_ring_cap,
             early_min_samples=spec.early_min_samples,
@@ -286,6 +286,8 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                     )
                     d = result.get("diag") or {}
                     lh_d = result["left_heatmap"]
+                    if lh_d is None:  # confidence-gated window
+                        lh_d = np.zeros((1,), dtype=np.float32)
                     dumper.add_cycle(
                         {
                             "cycle": cycles_processed,
@@ -358,6 +360,10 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                     audio_sample_count=len(left_pcm) // 2,  # PCM16 = 2 bytes per sample
                     model_id=model_id,
                     heatmap_count=spec.heatmap_count,
+                    # Raw-CAM positive fraction for confidence-gated models;
+                    # 0.0 for models without a gate. When gated off, the
+                    # heatmap bytes above are already empty.
+                    cam_confidence=result.get("confidence", 0.0),
                 )
                 seq_number += 1
 
@@ -366,10 +372,14 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                 # print every 10 cycles (or immediately when cycle is slow).
                 if cycles_processed % 10 == 0 or total_cycle_time > 140:
                     lh = result["left_heatmap"]
+                    hm_desc = (
+                        f"min={lh.min():.4f} max={lh.max():.4f} std={lh.std():.4f}"
+                        if lh is not None
+                        else "gated (low CAM confidence)"
+                    )
                     logger.info(
                         f"Cycle Complete: Inf={inf_time}ms, Post={post_time}ms, "
-                        f"Total={total_cycle_time}ms | Heatmap L min={lh.min():.4f} "
-                        f"max={lh.max():.4f} std={lh.std():.4f}"
+                        f"Total={total_cycle_time}ms | Heatmap L {hm_desc}"
                     )
 
                 if chunk.is_last:

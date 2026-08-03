@@ -43,9 +43,13 @@ class ModelSpec:
     audio_chunk_field: str       # StreamChunk field carrying this model's audio
 
     # -- server-side window --
-    model_sample_rate: int       # rate the model consumes
-    window_samples: int          # samples per inference window, at model rate
-    hop_samples: int             # OLA hop, at model rate (exact int, no ms rounding)
+    # window/hop are in the WIRE domain (capture_sample_rate): the streaming
+    # buffer and overlap-add run at the wire rate end to end. An engine whose
+    # model rate differs (multisensory: 21000 vs 22050) converts at its own
+    # boundary and returns audio back at the wire rate.
+    model_sample_rate: int       # rate the model consumes internally
+    window_samples: int          # samples per inference window, at capture_sample_rate
+    hop_samples: int             # OLA hop, at capture_sample_rate (exact int, no ms rounding)
     num_frames: int              # frames per inference window
     frame_selection: str         # "centered_triple" | "consecutive_span"
     frame_ring_cap: int          # max frames retained in the ring buffer
@@ -62,6 +66,12 @@ def _sonicsight_engine():
     from engines.sonicsight_engine import SonicSightEngine
 
     return SonicSightEngine()
+
+
+def _multisensory_engine():
+    from engines.multisensory_engine import MultisensoryEngine
+
+    return MultisensoryEngine()
 
 
 SONICSIGHT_SPEC = ModelSpec(
@@ -92,9 +102,41 @@ SONICSIGHT_SPEC = ModelSpec(
 )
 
 
+MULTISENSORY_SPEC = ModelSpec(
+    id="multisensory",
+    display_name="Speech",
+    description=(
+        "Multisensory: separates the on-screen speaker from off-screen sound "
+        "using audio-video alignment, with one full-frame heatmap showing how "
+        "strongly each region explains the audio. Strongest on speech."
+    ),
+    engine_factory=_multisensory_engine,
+    frame_rate=30,                               # ~29.97 fps capture
+    capture_sample_rate=22050,                   # 44100/2, exact on-device decimation
+    frame_kind="full_letterboxed",               # 1280x720 -> 224x126 + 49 grey rows
+    frame_dim=224,
+    audio_chunk_field="audio_pcm_hi",
+    model_sample_rate=21000,                     # engine resamples 22050<->21000 (21:20)
+    window_samples=46352,                        # the LOCKED 2.135 s window, at wire rate
+    hop_samples=5512,                            # 250 ms hop: inference is 142-148 ms, so
+                                                 # the 125 ms sonicsight hop cannot be
+                                                 # sustained and the lag compounds
+    num_frames=63,
+    frame_selection="consecutive_span",
+    frame_ring_cap=90,                           # 63/window + lag margin (~3 s @ 30 fps)
+    early_min_samples=46352,                     # == window: early mode disabled; the
+                                                 # window is only 2.1 s and the early-mode
+                                                 # machinery exists to shave SoP's 5.9 s fill
+    output_sample_rate=22050,                    # separated audio returns at wire rate
+    heatmap_count=1,
+    stream_labels=("On-screen", "Off-screen"),   # NEVER "Left / Right" on this branch
+    confidence_gated=True,
+)
+
+
 REGISTRY = {
     SONICSIGHT_SPEC.id: SONICSIGHT_SPEC,
-    # The multisensory spec is added together with its engine adapter.
+    MULTISENSORY_SPEC.id: MULTISENSORY_SPEC,
 }
 
 
