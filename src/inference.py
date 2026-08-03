@@ -52,9 +52,33 @@ logger = logging.getLogger(__name__)
 class StreamingBuffer:
     """Manages a rolling buffer of frames and audio for near real-time inference."""
 
-    def __init__(self, target_audio_len=AUD_LEN, target_sr=AUD_RATE):
+    def __init__(
+        self,
+        target_audio_len=AUD_LEN,
+        target_sr=AUD_RATE,
+        num_frames=NUM_FRAMES,
+        frame_ring_cap=60,
+        early_min_samples=None,
+        frame_selection="centered_triple",
+    ):
         self.target_audio_len = target_audio_len
         self.target_sr = target_sr
+
+        # Per-model window configuration (instance state, NOT class state, so
+        # two concurrently open streams with different models cannot collide).
+        self.num_frames = int(num_frames)
+        self.frame_ring_cap = int(frame_ring_cap)
+        # Minimum audio before early inference is attempted. Below ~1 second
+        # the spectrogram is too empty for meaningful separation. Setting it
+        # equal to target_audio_len disables early mode entirely.
+        self.early_min_samples = (
+            int(early_min_samples) if early_min_samples is not None else int(self.target_sr)
+        )
+        # "centered_triple": [center-1, center, center+1] left/right halves
+        #                    (Sound of Pixels), returned as (left[3], right[3]).
+        # "consecutive_span": num_frames consecutive full frames around the
+        #                     center, returned as a flat list of PIL images.
+        self.frame_selection = frame_selection
 
         # Audio buffer (PCM 16-bit float)
         self.audio_chunks = []
@@ -111,7 +135,13 @@ class StreamingBuffer:
         right_img = Image.open(io.BytesIO(right_jpeg)).convert("RGB")
         return timestamp_ms, left_img, right_img
 
-    def add_decoded_frame(self, timestamp_ms, left_img, right_img):
+    def decode_full_image(self, timestamp_ms, full_jpeg):
+        import io
+
+        full_img = Image.open(io.BytesIO(full_jpeg)).convert("RGB")
+        return timestamp_ms, full_img
+
+    def add_decoded_frame(self, timestamp_ms, left_img, right_img, full_img=None):
         timestamp_ms = int(timestamp_ms)
 
         if timestamp_ms <= self.last_processed_timestamp_ms:
@@ -131,12 +161,18 @@ class StreamingBuffer:
             return
 
         self.frame_buffer.append(
-            {"timestamp_ms": timestamp_ms, "left_img": left_img, "right_img": right_img}
+            {
+                "timestamp_ms": timestamp_ms,
+                "left_img": left_img,
+                "right_img": right_img,
+                "full_img": full_img,
+            }
         )
         self.last_frame_timestamp_ms = timestamp_ms
 
-        # Keep max 60 frames to be safe
-        if len(self.frame_buffer) > 60:
+        # Ring cap to bound memory (60 for Sound of Pixels; larger for models
+        # that consume long consecutive frame spans)
+        if len(self.frame_buffer) > self.frame_ring_cap:
             self.frame_buffer.pop(0)
 
     def add_frame(self, timestamp_ms, left_jpeg, right_jpeg, width, height):
@@ -149,23 +185,47 @@ class StreamingBuffer:
         except Exception as e:
             logger.info(f"Error decoding frame: {e}")
 
-    # Minimum audio to start early inference (1 second = 11025 samples).
-    # Below this the spectrogram is too empty for any meaningful separation.
-    EARLY_INFERENCE_MIN_SAMPLES = AUD_RATE  # 11025 = 1 second
-
     def has_enough_data(self):
         """Checks if we have basic minimum requirements to even attempt finding a window."""
-        if self.total_audio_samples < self.EARLY_INFERENCE_MIN_SAMPLES:
+        if self.total_audio_samples < self.early_min_samples:
             return False
-        if len(self.frame_buffer) < NUM_FRAMES:
+        if len(self.frame_buffer) < self.num_frames:
             return False
         return True
+
+    def _select_frames(self, center_idx):
+        """Build the model's frame input around center_idx.
+
+        Returns (frames, trim_start): the frames object handed to the engine
+        and the buffer index older frames can be trimmed from after a
+        successful window.
+        """
+        if self.frame_selection == "consecutive_span":
+            half = self.num_frames // 2
+            start = center_idx - half
+            start = max(0, min(start, len(self.frame_buffer) - self.num_frames))
+            sel = self.frame_buffer[start : start + self.num_frames]
+            return [entry["full_img"] for entry in sel], start
+
+        # "centered_triple" — the original Sound of Pixels selection, verbatim.
+        left_frames = [
+            self.frame_buffer[center_idx - 1]["left_img"],
+            self.frame_buffer[center_idx]["left_img"],
+            self.frame_buffer[center_idx + 1]["left_img"],
+        ]
+        right_frames = [
+            self.frame_buffer[center_idx - 1]["right_img"],
+            self.frame_buffer[center_idx]["right_img"],
+            self.frame_buffer[center_idx + 1]["right_img"],
+        ]
+        return (left_frames, right_frames), center_idx - 1
 
     def get_latest_window(self):
         """
         Returns the most recent valid window for inference:
-        - 65536 samples of audio (zero-padded if in early mode)
-        - 3 frames centered precisely in the audio stream
+        - target_audio_len samples of audio (zero-padded if in early mode)
+        - num_frames frames centered precisely in the audio stream
+          (selection shape per self.frame_selection)
 
         Sets self._last_window_mode to:
           'early'  — audio was zero-padded (< target_audio_len available)
@@ -195,25 +255,15 @@ class StreamingBuffer:
             audio_window = np.zeros(self.target_audio_len, dtype=np.float32)
             audio_window[:len(real_audio)] = real_audio
 
-            # Use the latest 3 frames as visual context
-            # (we guaranteed >= NUM_FRAMES in has_enough_data)
+            # Use the latest frames as visual context
+            # (we guaranteed >= num_frames in has_enough_data)
             valid_center_idx = len(self.frame_buffer) - 2
             if valid_center_idx < 1:
                 valid_center_idx = 1
             if valid_center_idx >= len(self.frame_buffer) - 1:
                 valid_center_idx = len(self.frame_buffer) - 2
 
-            left_frames = [
-                self.frame_buffer[valid_center_idx - 1]["left_img"],
-                self.frame_buffer[valid_center_idx]["left_img"],
-                self.frame_buffer[valid_center_idx + 1]["left_img"],
-            ]
-            right_frames = [
-                self.frame_buffer[valid_center_idx - 1]["right_img"],
-                self.frame_buffer[valid_center_idx]["right_img"],
-                self.frame_buffer[valid_center_idx + 1]["right_img"],
-            ]
-            frames_tuple = (left_frames, right_frames)
+            frames_tuple, _ = self._select_frames(valid_center_idx)
 
             center_timestamp = self.frame_buffer[valid_center_idx]["timestamp_ms"]
 
@@ -328,24 +378,15 @@ class StreamingBuffer:
             audio_window = self.audio_chunks[0][
                 audio_start_idxFor_slice:audio_end_idxFor_slice
             ]
-            left_frames = [
-                self.frame_buffer[valid_center_idx - 1]["left_img"],
-                self.frame_buffer[valid_center_idx]["left_img"],
-                self.frame_buffer[valid_center_idx + 1]["left_img"],
-            ]
-            right_frames = [
-                self.frame_buffer[valid_center_idx - 1]["right_img"],
-                self.frame_buffer[valid_center_idx]["right_img"],
-                self.frame_buffer[valid_center_idx + 1]["right_img"],
-            ]
-            frames_tuple = (left_frames, right_frames)
+            frames_tuple, trim_start = self._select_frames(valid_center_idx)
 
             center_timestamp = int(t_frame)
             self.last_processed_timestamp_ms = center_timestamp
             self.last_processed_window_start_sample = absolute_window_start_sample
 
-            # Remove older frames to prevent memory bloat
-            self.frame_buffer = self.frame_buffer[valid_center_idx - 1 :]
+            # Remove older frames to prevent memory bloat (never trim past the
+            # frames the current selection still references)
+            self.frame_buffer = self.frame_buffer[trim_start:]
 
             return (
                 audio_window,
