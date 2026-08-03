@@ -18,6 +18,14 @@ from overlap_add_buffer import OverlapAddBuffer
 from video_preprocessor import VideoPreprocessor
 from config import AUD_RATE, STREAM_DUMP, STREAM_DUMP_DIR
 from stream_dump import StreamDumper
+from model_registry import (
+    DEFAULT_MODEL_ID,
+    MODEL_METADATA_KEY,
+    REGISTRY,
+    get_engine,
+    load_all_engines,
+    loaded_model_ids,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,19 +39,51 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
 
     async def HealthCheck(self, request, context):
         device_str = str(inference.device) if inference.device else "not loaded"
+        loaded = loaded_model_ids()
         return sonicsight_pb2.HealthResponse(
-            model_loaded=inference.is_loaded,
+            model_loaded=bool(loaded),
             device=device_str,
+            loaded_models=loaded,
         )
 
     async def StreamProcess(self, request_iterator, context):
-        logger.info("Client connected for StreamProcess...")
+        # Model selection: gRPC metadata key "sonicsight-model". Absent ->
+        # default model, so pre-registry clients keep working unchanged.
+        # Switching models is always cancel-stream + reopen; the capture
+        # profiles are incompatible mid-stream.
+        metadata = dict(context.invocation_metadata())
+        model_id = metadata.get(MODEL_METADATA_KEY, DEFAULT_MODEL_ID)
+        spec = REGISTRY.get(model_id)
+        if spec is None:
+            await context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                f"Unknown model '{model_id}'. Available: {', '.join(sorted(REGISTRY))}",
+            )
+        engine = get_engine(model_id)
+        if not engine.is_loaded:
+            await context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                f"Model '{model_id}' is not loaded on this server.",
+            )
+
+        logger.info("Client connected for StreamProcess (model=%s)...", model_id)
         start_process_time = time.time()
 
-        # Initialize streaming buffer for this connection
-        buffer = StreamingBuffer()
-        left_ola = OverlapAddBuffer()
-        right_ola = OverlapAddBuffer()
+        # Initialize streaming buffer for this connection, shaped by the spec
+        buffer = StreamingBuffer(
+            target_audio_len=spec.window_samples,
+            target_sr=spec.model_sample_rate,
+            num_frames=spec.num_frames,
+            frame_ring_cap=spec.frame_ring_cap,
+            early_min_samples=spec.early_min_samples,
+            frame_selection=spec.frame_selection,
+        )
+        left_ola = OverlapAddBuffer(
+            window_len=spec.window_samples, hop_samples=spec.hop_samples
+        )
+        right_ola = OverlapAddBuffer(
+            window_len=spec.window_samples, hop_samples=spec.hop_samples
+        )
 
         # Diagnostic recorder (SONICSIGHT_DUMP_STREAM=1). control_ola is fed
         # the UNSEPARATED input window through the identical overlap-add path,
@@ -55,7 +95,9 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
         if STREAM_DUMP:
             session_dir = os.path.join(STREAM_DUMP_DIR, time.strftime("%Y%m%d_%H%M%S"))
             dumper = StreamDumper(session_dir)
-            control_ola = OverlapAddBuffer()
+            control_ola = OverlapAddBuffer(
+                window_len=spec.window_samples, hop_samples=spec.hop_samples
+            )
             logger.info("STREAM DUMP ENABLED -> %s", session_dir)
 
         # Track processing state
@@ -70,25 +112,40 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                 chunk_receive_time = time.time()
                 chunks_received += 1
 
-                # 1. Add data to buffer
-                if chunk.audio_pcm:
-                    buffer.add_audio_chunk(chunk.audio_pcm, chunk.timestamp_ms)
+                # 1. Add data to buffer. Which chunk fields feed this stream
+                # comes from the spec: audio_pcm + left/right JPEG halves for
+                # the sonicsight branch, audio_pcm_hi + full_jpeg for models
+                # taking the whole frame.
+                audio_bytes = getattr(chunk, spec.audio_chunk_field)
+                if audio_bytes:
+                    buffer.add_audio_chunk(audio_bytes, chunk.timestamp_ms)
                     # DEBUG: Check if audio is silent
-                    audio_arr = np.frombuffer(chunk.audio_pcm, dtype=np.int16)
+                    audio_arr = np.frombuffer(audio_bytes, dtype=np.int16)
                     if dumper is not None:
-                        dumper.add_mic(chunk.audio_pcm, chunk.timestamp_ms)
+                        dumper.add_mic(audio_bytes, chunk.timestamp_ms)
                     if chunks_received % 20 == 0:
                         logger.info(f"Incoming audio max amp: {np.max(np.abs(audio_arr))}")
 
-                if chunk.left_jpeg and chunk.right_jpeg:
+                if spec.frame_kind == "left_right_halves":
+                    if chunk.left_jpeg and chunk.right_jpeg:
+                        try:
+                            timestamp_ms, left_img, right_img = await asyncio.to_thread(
+                                buffer.decode_images,
+                                chunk.timestamp_ms,
+                                chunk.left_jpeg,
+                                chunk.right_jpeg
+                            )
+                            buffer.add_decoded_frame(timestamp_ms, left_img, right_img)
+                        except Exception as e:
+                            logger.info(f"Error decoding frame: {e}")
+                elif chunk.full_jpeg:
                     try:
-                        timestamp_ms, left_img, right_img = await asyncio.to_thread(
-                            buffer.decode_images,
+                        timestamp_ms, full_img = await asyncio.to_thread(
+                            buffer.decode_full_image,
                             chunk.timestamp_ms,
-                            chunk.left_jpeg,
-                            chunk.right_jpeg
+                            chunk.full_jpeg,
                         )
-                        buffer.add_decoded_frame(timestamp_ms, left_img, right_img)
+                        buffer.add_decoded_frame(timestamp_ms, None, None, full_img)
                     except Exception as e:
                         logger.info(f"Error decoding frame: {e}")
 
@@ -99,7 +156,9 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                         yield sonicsight_pb2.StreamResult(
                             success=True,
                             is_buffering=True,
-                            timestamp_ms=chunk.timestamp_ms
+                            timestamp_ms=chunk.timestamp_ms,
+                            model_id=model_id,
+                            heatmap_count=spec.heatmap_count,
                         )
                     continue
 
@@ -111,11 +170,13 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
 
                 if audio_window is None:
                     # Still waiting for future audio to arrive to match the current frames
-                    if chunks_received % 10 == 0: 
+                    if chunks_received % 10 == 0:
                         yield sonicsight_pb2.StreamResult(
                             success=True,
                             is_buffering=True,
-                            timestamp_ms=chunk.timestamp_ms
+                            timestamp_ms=chunk.timestamp_ms,
+                            model_id=model_id,
+                            heatmap_count=spec.heatmap_count,
                         )
                     continue
 
@@ -129,7 +190,7 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                 inference_start_time = time.time()
                 async with self._inference_lock:
                     result = await asyncio.to_thread(
-                        inference.eval_stream_window,
+                        engine.eval_stream_window,
                         audio_window,
                         frames
                     )
@@ -181,6 +242,8 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                         success=True,
                         is_buffering=True,
                         timestamp_ms=center_timestamp,
+                        model_id=model_id,
+                        heatmap_count=spec.heatmap_count,
                     )
                     last_yielded_timestamp = center_timestamp
                     continue
@@ -275,20 +338,26 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                 # can clearly see that post-processing happened.
                 post_time = max(1, int((time.time() - post_start_time) * 1000))
 
+                # A model with heatmap_count == 1 returns right_heatmap=None;
+                # its single map rides in left_heatmap and right stays empty.
+                left_hm = result["left_heatmap"]
+                right_hm = result.get("right_heatmap")
                 yield sonicsight_pb2.StreamResult(
                     success=True,
                     is_buffering=False,
                     timestamp_ms=center_timestamp,
                     left_audio_pcm=left_pcm,
                     right_audio_pcm=right_pcm,
-                    left_heatmap=(result["left_heatmap"] * 255).astype(np.uint8).tobytes(),
-                    right_heatmap=(result["right_heatmap"] * 255).astype(np.uint8).tobytes(),
+                    left_heatmap=(left_hm * 255).astype(np.uint8).tobytes() if left_hm is not None else b"",
+                    right_heatmap=(right_hm * 255).astype(np.uint8).tobytes() if right_hm is not None else b"",
                     center_frame_jpeg=b"", # Empty to save bandwidth
                     inference_time_ms=inf_time,
                     post_processing_time_ms=post_time,
                     total_server_time_ms=total_cycle_time,
                     sequence_number=seq_number,
                     audio_sample_count=len(left_pcm) // 2,  # PCM16 = 2 bytes per sample
+                    model_id=model_id,
+                    heatmap_count=spec.heatmap_count,
                 )
                 seq_number += 1
 
@@ -328,6 +397,8 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                     inference_time_ms=0,
                     post_processing_time_ms=0,
                     total_server_time_ms=0,
+                    model_id=model_id,
+                    heatmap_count=spec.heatmap_count,
                 )
 
         except grpc.aio.AbortError:
@@ -335,7 +406,8 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
         except torch.cuda.OutOfMemoryError:
             yield sonicsight_pb2.StreamResult(
                 success=False,
-                error_message="GPU out of memory."
+                error_message="GPU out of memory.",
+                model_id=model_id,
             )
         except Exception as e:
             import traceback
@@ -343,6 +415,7 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
             yield sonicsight_pb2.StreamResult(
                 success=False,
                 error_message=str(e),
+                model_id=model_id,
             )
         finally:
             if dumper is not None:
@@ -521,5 +594,5 @@ async def serve(port=50051):
 
 
 if __name__ == "__main__":
-    inference.load_model()
+    load_all_engines()
     asyncio.run(serve())

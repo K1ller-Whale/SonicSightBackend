@@ -10,8 +10,8 @@ src_dir = os.path.dirname(os.path.abspath(__file__))
 if src_dir not in sys.path:
     sys.path.insert(0, src_dir)
 
-from inference import inference
 from grpc_server import serve as grpc_serve
+from model_registry import load_all_engines
 
 
 logging.basicConfig(
@@ -33,8 +33,9 @@ async def run_grpc(port=50051):
 
 
 def main():
-    # Load model once (shared singleton)
-    inference.load_model()
+    # Load every registered model once (shared singletons). A model that
+    # fails to load is skipped and advertised as absent via HealthCheck.
+    load_all_engines()
 
     # Start FastAPI in a background thread
     fastapi_thread = threading.Thread(
