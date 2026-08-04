@@ -1,3 +1,8 @@
+# Core inference (was missing from this file although imported everywhere).
+# Install the CUDA build matching your driver; see pytorch.org for the index URL.
+torch>=2.0.0
+torchvision>=0.15.0
+
 fastapi>=0.100.0
 python-multipart>=0.0.6
 uvicorn>=0.20.0
@@ -13,3 +18,8 @@ protobuf>=4.25.0
 python-dotenv>=1.0.0
 librosa>=0.10.0
 soundfile>=0.12.0
+
+# NOT listed: TensorFlow. The multisensory engine needs tensorflow[and-cuda]==2.21
+# plus tf_keras and tf_slim, GPU only under WSL2/Linux — install per the
+# multisensory repo's environment notes. The server runs without it; HealthCheck
+# then simply omits "multisensory" from loaded_models.
