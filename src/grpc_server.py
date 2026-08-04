@@ -77,6 +77,7 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
             frame_ring_cap=spec.frame_ring_cap,
             early_min_samples=spec.early_min_samples,
             frame_selection=spec.frame_selection,
+            window_min_advance=spec.window_min_advance,
         )
         left_ola = OverlapAddBuffer(
             window_len=spec.window_samples, hop_samples=spec.hop_samples

@@ -61,6 +61,14 @@ class ModelSpec:
     stream_labels: Tuple[str, str]
     confidence_gated: bool       # True: heatmap withheld when CAM confidence is low
 
+    # Minimum timeline advance (samples at the wire rate) between consecutive
+    # inference windows. 1 = pace by frame arrival (Sound of Pixels: 8 fps
+    # already IS the 125 ms hop). Models whose frame rate outruns their hop
+    # must set this to hop_samples, or a new window exists after every frame
+    # and inference runs back-to-back: GPU pegged, the chunk-ingest loop
+    # starves, and the stream falls behind real time.
+    window_min_advance: int = 1
+
 
 def _sonicsight_engine():
     from engines.sonicsight_engine import SonicSightEngine
@@ -131,6 +139,10 @@ MULTISENSORY_SPEC = ModelSpec(
     heatmap_count=1,
     stream_labels=("On-screen", "Off-screen"),   # NEVER "Left / Right" on this branch
     confidence_gated=True,
+    window_min_advance=5512,                     # = hop: at 30 fps every frame offers a
+                                                 # newer window; without this the 250 ms
+                                                 # hop is never honoured and inference
+                                                 # runs back-to-back at ~150 ms
 )
 
 
