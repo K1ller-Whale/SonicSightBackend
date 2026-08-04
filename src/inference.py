@@ -60,6 +60,7 @@ class StreamingBuffer:
         frame_ring_cap=60,
         early_min_samples=None,
         frame_selection="centered_triple",
+        window_min_advance=1,
     ):
         self.target_audio_len = target_audio_len
         self.target_sr = target_sr
@@ -79,6 +80,10 @@ class StreamingBuffer:
         # "consecutive_span": num_frames consecutive full frames around the
         #                     center, returned as a flat list of PIL images.
         self.frame_selection = frame_selection
+        # Minimum sample advance between consecutive windows (the model's hop
+        # for high-frame-rate models; 1 = pace by frame arrival). Enforced
+        # only after the first window so startup latency is unaffected.
+        self.window_min_advance = int(window_min_advance)
 
         # Audio buffer (PCM 16-bit float)
         self.audio_chunks = []
@@ -352,18 +357,21 @@ class StreamingBuffer:
                 audio_end_idxFor_slice = end_sample
                 absolute_window_start_sample = self.audio_base_sample + start_sample
 
-                if (
-                    absolute_window_start_sample
-                    <= self.last_processed_window_start_sample
-                ):
-                    # Normal under audio starvation (frames ahead of buffered
-                    # audio): every remaining, older frame will fail this test
-                    # too, and the backward sweep would log ~ring-cap lines per
-                    # call on the latency path. One debug line, then bail.
+                last_start = self.last_processed_window_start_sample
+                min_required = (
+                    last_start + self.window_min_advance if last_start >= 0 else 0
+                )
+                if absolute_window_start_sample < max(min_required, last_start + 1):
+                    # Not enough timeline advance yet — either audio starvation
+                    # (frames ahead of buffered audio) or, for high-frame-rate
+                    # models, the enforced hop. Candidate starts only decrease
+                    # for older frames, so bail instead of sweeping the whole
+                    # ring and logging per frame on the latency path.
                     logger.debug(
-                        "No monotonic window available: newest candidate start_sample=%s last_start=%s frame=%sms",
+                        "No eligible window yet: newest candidate start_sample=%s last_start=%s min_advance=%s frame=%sms",
                         absolute_window_start_sample,
-                        self.last_processed_window_start_sample,
+                        last_start,
+                        self.window_min_advance,
                         t_frame,
                     )
                     # valid_center_idx was already assigned above; clear it so

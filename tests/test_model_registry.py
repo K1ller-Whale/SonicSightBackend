@@ -80,6 +80,15 @@ def test_buffer_defaults_match_pre_registry_behaviour():
     assert "EARLY_INFERENCE_MIN_SAMPLES" not in StreamingBuffer.__dict__
 
 
+def test_window_min_advance_defaults_preserve_sop_semantics():
+    # SoP: min_advance 1 == the old strict "start > last" rule, unchanged.
+    assert REGISTRY["sonicsight"].window_min_advance == 1
+    # Multisensory: paced by its hop, or 30 fps frames offer a newer window
+    # after every frame and inference runs back-to-back at ~150 ms.
+    assert REGISTRY["multisensory"].window_min_advance == REGISTRY["multisensory"].hop_samples == 5512
+    assert StreamingBuffer().window_min_advance == 1
+
+
 def test_two_buffers_do_not_collide():
     a = StreamingBuffer()
     b = StreamingBuffer(
