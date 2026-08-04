@@ -356,13 +356,20 @@ class StreamingBuffer:
                     absolute_window_start_sample
                     <= self.last_processed_window_start_sample
                 ):
-                    logger.warning(
-                        "Skipping non-monotonic inference window: start_sample=%s last_start=%s frame=%sms",
+                    # Normal under audio starvation (frames ahead of buffered
+                    # audio): every remaining, older frame will fail this test
+                    # too, and the backward sweep would log ~ring-cap lines per
+                    # call on the latency path. One debug line, then bail.
+                    logger.debug(
+                        "No monotonic window available: newest candidate start_sample=%s last_start=%s frame=%sms",
                         absolute_window_start_sample,
                         self.last_processed_window_start_sample,
                         t_frame,
                     )
-                    continue
+                    # valid_center_idx was already assigned above; clear it so
+                    # this stale candidate is not returned as a window.
+                    valid_center_idx = -1
+                    break
                 
                 # Recompute the exact center timestamp of this sample-aligned window
                 # so the gRPC server can extract absolute chunks accurately
