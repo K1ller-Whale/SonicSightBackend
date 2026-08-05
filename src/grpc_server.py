@@ -468,10 +468,11 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
             EnergyMapSmoother,
             WindowCache,
             WindowCacheRing,
-            cell_maps,
+            cell_analysis,
             region_disc,
             synthesize_regions,
         )
+        from clustering import discover_sources
 
         logger.info("Client connected for StreamProcess (model=%s, pixel mode)...", model_id)
 
@@ -502,6 +503,16 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
         last_yielded_timestamp = -1
         frozen = False        # level-triggered freeze state (rising edge pins)
         pinned_id = None
+        # Source discovery enable: a TTL latch, not a per-chunk level. The
+        # phone's audio and frame chunks are built by different threads, so a
+        # per-chunk level would flap off on every chunk that omits the flag
+        # (review finding). Any request_clusters=true arms the latch for
+        # CLUSTERS_TTL chunks (~1 s at ~16 chunks/s); expiry is the falling
+        # edge and resets persistence state, so stale identities cannot be
+        # resurrected minutes later.
+        CLUSTERS_TTL = 16
+        clusters_ttl = 0
+        cluster_state = None  # label persistence across windows
 
         try:
             async for chunk in request_iterator:
@@ -535,8 +546,13 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                     logger.info("Pixel freeze released")
                 frozen = chunk.freeze
 
-                # chunk.request_clusters: source discovery lands in Phase 3;
-                # accepted and ignored here so older servers stay compatible.
+                if chunk.request_clusters:
+                    clusters_ttl = CLUSTERS_TTL
+                elif clusters_ttl > 0:
+                    clusters_ttl -= 1
+                    if clusters_ttl == 0:
+                        cluster_state = None  # falling edge: no stale revivals
+                clusters_on = clusters_ttl > 0
 
                 # ── Answer queries against the cache (no inference) ──
                 pixel_answers = []
@@ -626,11 +642,31 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                                 start_sample=window_start_sample,
                                 center_timestamp_ms=center_timestamp,
                             )
-                            energy_map_arr, _activation_map = await asyncio.to_thread(
-                                cell_maps, engine, cache
+                            energy_map_arr, _activation_map, cell_feats = (
+                                await asyncio.to_thread(
+                                    cell_analysis, engine, cache, 28, clusters_on
+                                )
                             )
                         window_id = ring.push(cache)
                         energy_bytes = smoother.update(energy_map_arr)
+
+                        cluster_labels_bytes = b""
+                        cluster_protos = []
+                        if clusters_on and cell_feats is not None:
+                            label_map, found, cluster_state = discover_sources(
+                                cell_feats, energy_map_arr, cluster_state
+                            )
+                            cluster_labels_bytes = label_map.tobytes()
+                            cluster_protos = [
+                                sonicsight_pb2.SourceCluster(
+                                    cluster_id=c["cluster_id"],
+                                    centroid_x=c["centroid_x"],
+                                    centroid_y=c["centroid_y"],
+                                    energy=c["energy"],
+                                    rgb=c["rgb"],
+                                )
+                                for c in found
+                            ]
 
                         mix_ola.add_window(
                             audio_window, start_sample=window_start_sample
@@ -659,6 +695,8 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                             energy_map=energy_bytes,
                             grid_width=GRID_W,
                             grid_height=GRID_H,
+                            cluster_labels=cluster_labels_bytes,
+                            clusters=cluster_protos,
                             window_id=window_id,
                         )
                         seq_number += 1

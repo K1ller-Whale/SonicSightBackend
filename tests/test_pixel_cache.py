@@ -208,6 +208,20 @@ def test_cell_maps_shapes_and_chunk_equivalence(engine, cache):
     assert (a28 > 0).all() and (a28 < 1).all()  # mean of sigmoids
 
 
+def test_cell_analysis_features_shape_norm_and_chunk_equivalence(engine, cache):
+    from pixel_cache import cell_analysis
+
+    e1, a1, f1 = cell_analysis(engine, cache, chunk=28, with_features=True)
+    e2, a2, f2 = cell_analysis(engine, cache, chunk=196, with_features=True)
+    assert f1.shape == (GRID_H * GRID_W, 256)
+    assert np.allclose(np.linalg.norm(f1, axis=1), 1.0, atol=1e-5)
+    assert np.allclose(f1, f2, atol=1e-5)
+    assert np.allclose(e1, e2, rtol=1e-5, atol=1e-3)
+    # with_features=False returns None and identical maps
+    e3, a3, f3 = cell_analysis(engine, cache, chunk=28, with_features=False)
+    assert f3 is None and np.allclose(e1, e3, rtol=1e-5, atol=1e-3)
+
+
 def test_cell_maps_silent_mixture_has_zero_energy(engine, cache):
     silent = WindowCache(
         window_id=2,

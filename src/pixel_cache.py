@@ -238,18 +238,26 @@ def synthesize_regions(engine, cache: WindowCache, regions: List[torch.Tensor],
     return out_wavs, out_energy
 
 
-def cell_maps(engine, cache: WindowCache, chunk: int = 28):
-    """Per-cell maps for the whole grid, one vectorised pass, chunked.
+def cell_analysis(engine, cache: WindowCache, chunk: int = 28, with_features: bool = False):
+    """Per-cell quantities for the whole grid, ONE vectorised pass, chunked.
 
-    Returns (energy_map, activation_map), both float32 [GRID_H, GRID_W]:
-      energy_map     — sum((M_lin * |S_lin|)/gain)^2 per cell, LINEAR domain:
-                       the paper-faithful quantity that matches what plays
-                       (PIXEL_PLAN 2.3). Per-cell masks are raw sigmoids here
-                       (no renorm — there is no partition across 196 cells).
-      activation_map — mean of the sigmoid mask over the WARPED spectral dims:
-                       the only quantity ever validated live on a phone
-                       (the existing heatmap). Both are computed so they can
-                       be compared side by side before one ships (amendment B2).
+    Returns (energy_map, activation_map, features):
+      energy_map     — float32 [GRID_H, GRID_W]: sum((M_lin * |S_lin|)/gain)^2
+                       per cell, LINEAR domain: the paper-faithful quantity
+                       that matches what plays (PIXEL_PLAN 2.3). Per-cell
+                       masks are raw sigmoids (no renorm — there is no
+                       partition across 196 cells).
+      activation_map — float32 [GRID_H, GRID_W]: mean of the sigmoid mask over
+                       the WARPED spectral dims — the only quantity ever
+                       validated live on a phone (the existing heatmap). Both
+                       maps ship from one pass so they can be compared side by
+                       side before one is chosen (amendment B2).
+      features       — None unless with_features: float32 [GRID_H*GRID_W, 256]
+                       per-cell sound features for clustering — each cell's
+                       warped sigmoid mask average-pooled to 16 freq bands x
+                       16 time bins and L2-normalized (PIXEL_PLAN 4.1;
+                       computed in the same chunk loop so clustering does not
+                       pay a second 196-cell synthesizer pass).
     """
     with torch.inference_mode():
         device = cache.feat_sound.device
@@ -259,6 +267,7 @@ def cell_maps(engine, cache: WindowCache, chunk: int = 28):
 
         energy = torch.empty(n, device=device)
         activation = torch.empty(n, device=device)
+        feats = torch.empty(n, 16 * 16, device=device) if with_features else None
         for lo in range(0, n, chunk):
             hi = min(lo + chunk, n)
             v = vecs[lo:hi]                                   # [b, K]
@@ -266,6 +275,9 @@ def cell_maps(engine, cache: WindowCache, chunk: int = 28):
             z = engine.net_synth(v, fs)                        # [b, 1, 256, 256]
             msk = torch.sigmoid(z)
             activation[lo:hi] = msk.mean(dim=(1, 2, 3))
+            if with_features:
+                pooled = F.adaptive_avg_pool2d(msk, (16, 16)).reshape(hi - lo, -1)
+                feats[lo:hi] = F.normalize(pooled, dim=1)
             grid = engine.grid_unwarp.to(device=device, dtype=msk.dtype).expand(hi - lo, -1, -1, -1)
             m_lin = F.grid_sample(msk, grid, align_corners=True).squeeze(1)  # [b, 512, 256]
             pm = (m_lin * cache.mag_lin.unsqueeze(0)) / cache.audio_gain
@@ -274,7 +286,14 @@ def cell_maps(engine, cache: WindowCache, chunk: int = 28):
     return (
         energy.reshape(GRID_H, GRID_W).detach().cpu().numpy().astype(np.float32),
         activation.reshape(GRID_H, GRID_W).detach().cpu().numpy().astype(np.float32),
+        feats.detach().cpu().numpy().astype(np.float32) if with_features else None,
     )
+
+
+def cell_maps(engine, cache: WindowCache, chunk: int = 28):
+    """Back-compat wrapper: (energy_map, activation_map) only."""
+    energy, activation, _ = cell_analysis(engine, cache, chunk=chunk, with_features=False)
+    return energy, activation
 
 
 class EnergyMapSmoother:
