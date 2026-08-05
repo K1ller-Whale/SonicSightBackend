@@ -69,6 +69,13 @@ class ModelSpec:
     # starves, and the stream falls behind real time.
     window_min_advance: int = 1
 
+    # How the scene is divided. "halves": the existing left/right split —
+    # untouched, bit-exact, the default. "pixel": full-frame features cached
+    # per window; audio for any spatial region is synthesized on demand from
+    # the cache (PIXEL_PLAN.md). The mode rides the model id on the wire, so
+    # the client's existing model_id drop-filter handles mode staleness.
+    mode: str = "halves"
+
 
 def _sonicsight_engine():
     from engines.sonicsight_engine import SonicSightEngine
@@ -146,9 +153,39 @@ MULTISENSORY_SPEC = ModelSpec(
 )
 
 
+SONICSIGHT_PIXEL_SPEC = ModelSpec(
+    id="sonicsight-pixel",
+    display_name="Touch",
+    description=(
+        "Sound of Pixels, touch mode: hear any point you pick and mix the "
+        "sources it finds. Same model and checkpoint as the left/right mode; "
+        "the scene is divided by where you touch instead of down the middle."
+    ),
+    engine_factory=_sonicsight_engine,           # same singleton nets, loaded once
+    frame_rate=FRAME_RATE,                       # 8 — same cadence as halves
+    capture_sample_rate=AUD_RATE,                # 11025
+    frame_kind="full_letterboxed",               # full frame; touch needs the whole scene
+    frame_dim=IMG_SIZE,
+    audio_chunk_field="audio_pcm",
+    model_sample_rate=AUD_RATE,
+    window_samples=AUD_LEN,                      # 65536 — checkpoint-bound, unchanged
+    hop_samples=int(round(AUD_RATE / FRAME_RATE)),
+    num_frames=NUM_FRAMES,                       # 3 consecutive frames, like deployed halves
+    frame_selection="centered_triple_full",
+    frame_ring_cap=60,
+    early_min_samples=AUD_RATE,
+    output_sample_rate=AUD_RATE,
+    heatmap_count=0,                             # legacy heatmaps empty; native energy map instead
+    stream_labels=("Selection", "Everything else"),
+    confidence_gated=False,
+    mode="pixel",
+)
+
+
 REGISTRY = {
     SONICSIGHT_SPEC.id: SONICSIGHT_SPEC,
     MULTISENSORY_SPEC.id: MULTISENSORY_SPEC,
+    SONICSIGHT_PIXEL_SPEC.id: SONICSIGHT_PIXEL_SPEC,
 }
 
 

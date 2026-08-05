@@ -212,6 +212,17 @@ class StreamingBuffer:
             sel = self.frame_buffer[start : start + self.num_frames]
             return [entry["full_img"] for entry in sel], start
 
+        if self.frame_selection == "centered_triple_full":
+            # Pixel mode: same 3-consecutive-frame selection as the deployed
+            # streaming halves path (NOT the offline STRIDE_FRAMES spread),
+            # but returning the full letterboxed frames.
+            full_frames = [
+                self.frame_buffer[center_idx - 1]["full_img"],
+                self.frame_buffer[center_idx]["full_img"],
+                self.frame_buffer[center_idx + 1]["full_img"],
+            ]
+            return full_frames, center_idx - 1
+
         # "centered_triple" — the original Sound of Pixels selection, verbatim.
         left_frames = [
             self.frame_buffer[center_idx - 1]["left_img"],
@@ -1320,6 +1331,92 @@ class InferenceEngine:
             "left_center_frame": pil_left_center,
             "right_center_frame": pil_right_center,
             "diag": diag,
+        }
+
+    def eval_pixel_window(self, audio_array, full_frames):
+        """Pixel-mode feature pass: run the two expensive nets ONCE for a
+        window of full letterboxed frames and return the fp32 intermediates
+        the region cache needs. No masks are synthesized here — every spatial
+        selection is served later against the cache (PIXEL_PLAN section 2).
+
+        audio_array: float32 mono [-1, 1], AUD_LEN samples.
+        full_frames: 3 PIL RGB 224x224 letterboxed frames (centered triple).
+
+        Returns dict:
+            feat_sound [1, K, 256, 256] fp32, feats_img [1, K, 14, 14] fp32
+            (post-sigmoid, temporal-maxed — exactly the deployed pixel-path
+            recipe), mag_lin [512, 256] fp32, phase [512, 256] fp32,
+            audio_gain float.
+        """
+        with torch.inference_mode():
+            amp_ctx = (
+                torch.amp.autocast(
+                    device_type="cuda",
+                    enabled=(self.device.type == "cuda" and self.use_amp),
+                )
+                if self.device.type == "cuda"
+                else nullcontext()
+            )
+            with amp_ctx:
+                # Audio prep mirrors prepare_audio_from_buffer, but with a
+                # PIXEL-PRIVATE gain EMA. prepare_audio_from_buffer(smooth=True)
+                # mutates self._norm_gain_ema — the halves streams' state — and
+                # sharing it would break the halves byte-exactness promise the
+                # moment a pixel stream and a halves stream coexist in one
+                # process (caught in review).
+                y_segment = audio_array
+                if len(y_segment) != AUD_LEN:
+                    if len(y_segment) < AUD_LEN:
+                        y_segment = np.pad(y_segment, (0, AUD_LEN - len(y_segment)))
+                    else:
+                        y_segment = y_segment[:AUD_LEN]
+
+                inst_gain = self._audio_norm_gain(y_segment, smooth=False)
+                prev = getattr(self, "_pixel_gain_ema", None)
+                if prev is None:
+                    audio_gain = inst_gain
+                else:
+                    a = float(np.clip(AUDIO_NORM_SMOOTH, 0.0, 1.0))
+                    audio_gain = (1.0 - a) * prev + a * inst_gain
+                self._pixel_gain_ema = audio_gain
+
+                y_torch = torch.from_numpy(y_segment).to(self.device).float()
+                if audio_gain != 1.0:
+                    y_torch = y_torch * audio_gain
+                stft = torch.stft(
+                    y_torch,
+                    n_fft=STFT_FRAME,
+                    hop_length=STFT_HOP,
+                    window=self.hann_window,
+                    return_complex=True,
+                )[:512, :256]
+                mag_lin_torch = stft.abs().unsqueeze(0).unsqueeze(0)  # [1, 1, 512, 256]
+                phase_np = torch.angle(stft).cpu().numpy()
+
+                frames_tensor = (
+                    self._eval_transform(full_frames).unsqueeze(0).to(self.device)
+                )  # [1, 3, T, 224, 224]
+
+                mag_for_net = F.grid_sample(
+                    mag_lin_torch, self.grid_warp, align_corners=True
+                )
+                log_mag = torch.log(mag_for_net + 1e-10)
+                feat_sound = activate(self.net_sound(log_mag), "no")
+
+                feats_video = self.net_frame.forward_multiframe(
+                    frames_tensor, pool=False
+                )  # [1, K, T, 14, 14]
+                # Temporal max then sigmoid — the deployed pixel-path recipe
+                # (and the reason region MAX-pooling later equals video-level
+                # pooling restricted to the region: sigmoid is monotonic).
+                feats_img = activate(feats_video.max(dim=2)[0], "sigmoid")
+
+        return {
+            "feat_sound": feat_sound.float().clone(),
+            "feats_img": feats_img.float().clone(),
+            "mag_lin": mag_lin_torch.squeeze(0).squeeze(0).float().clone(),
+            "phase": torch.from_numpy(phase_np).to(self.device).float(),
+            "audio_gain": float(audio_gain),
         }
 
     def eval_for_grpc(self, audio_path, frames_dir, num_frames):

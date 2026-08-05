@@ -66,6 +66,16 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                 f"Model '{model_id}' is not loaded on this server.",
             )
 
+        # Pixel mode gets its own loop: cache-and-query architecture, no
+        # left/right synthesis. The halves/multisensory path below is not
+        # shared with it and stays byte-identical.
+        if spec.mode == "pixel":
+            async for result in self._pixel_stream(
+                request_iterator, context, spec, engine, model_id
+            ):
+                yield result
+            return
+
         logger.info("Client connected for StreamProcess (model=%s)...", model_id)
         start_process_time = time.time()
 
@@ -442,6 +452,265 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                     }
                 )
                 logger.info("STREAM DUMP WRITTEN: %s", summary)
+
+    async def _pixel_stream(self, request_iterator, context, spec, engine, model_id):
+        """Pixel-mode stream loop (PIXEL_PLAN.md sections 2 and 5).
+
+        Per completed window: one feature pass, cached in a small ring; the
+        energy map and the mixture go out with the window result. Spatial
+        queries arrive in-band and are answered against the cache — one
+        InnerProd bmm + ISTFT, never a network forward, so a tap costs
+        milliseconds while the window cadence stays at the 125 ms hop.
+        """
+        from pixel_cache import (
+            GRID_H,
+            GRID_W,
+            EnergyMapSmoother,
+            WindowCache,
+            WindowCacheRing,
+            cell_maps,
+            region_disc,
+            synthesize_regions,
+        )
+
+        logger.info("Client connected for StreamProcess (model=%s, pixel mode)...", model_id)
+
+        buffer = StreamingBuffer(
+            target_audio_len=spec.window_samples,
+            target_sr=spec.capture_sample_rate,
+            num_frames=spec.num_frames,
+            frame_ring_cap=spec.frame_ring_cap,
+            early_min_samples=spec.early_min_samples,
+            frame_selection=spec.frame_selection,
+            window_min_advance=spec.window_min_advance,
+        )
+        # The mixture baseline rides left_audio_pcm: identity "mask" through
+        # the same center-slice OLA stitching the other modes use.
+        mix_ola = OverlapAddBuffer(
+            window_len=spec.window_samples, hop_samples=spec.hop_samples
+        )
+        ring = WindowCacheRing(capacity=3)
+        smoother = EnergyMapSmoother()
+
+        MAX_QUERIES = 4  # proto contract; excess answered with an error
+        # Safety net shared with the halves path: never hand the phone more
+        # than its ~1.5 s jitter buffer in one drain.
+        SAFE_DRAIN_SAMPLES = int(spec.output_sample_rate * 1.5)
+
+        chunks_received = 0
+        seq_number = 0
+        last_yielded_timestamp = -1
+        frozen = False        # level-triggered freeze state (rising edge pins)
+        pinned_id = None
+
+        try:
+            async for chunk in request_iterator:
+                chunks_received += 1
+
+                audio_bytes = getattr(chunk, spec.audio_chunk_field)
+                if audio_bytes:
+                    buffer.add_audio_chunk(audio_bytes, chunk.timestamp_ms)
+
+                if chunk.full_jpeg:
+                    try:
+                        timestamp_ms, full_img = await asyncio.to_thread(
+                            buffer.decode_full_image,
+                            chunk.timestamp_ms,
+                            chunk.full_jpeg,
+                        )
+                        buffer.add_decoded_frame(timestamp_ms, None, None, full_img)
+                    except Exception as e:
+                        logger.info(f"Error decoding frame: {e}")
+
+                # Freeze is LEVEL-triggered on the wire (the client holds it
+                # true while frozen); the pin happens on the rising edge only,
+                # and window_id=0 queries resolve to the pinned window while
+                # frozen — the client never has to guess the server's id.
+                if chunk.freeze and not frozen:
+                    pinned_id = ring.pin_newest()
+                    logger.info("Pixel freeze: pinned window_id=%s", pinned_id)
+                elif not chunk.freeze and frozen:
+                    ring.unpin_all()
+                    pinned_id = None
+                    logger.info("Pixel freeze released")
+                frozen = chunk.freeze
+
+                # chunk.request_clusters: source discovery lands in Phase 3;
+                # accepted and ignored here so older servers stay compatible.
+
+                # ── Answer queries against the cache (no inference) ──
+                pixel_answers = []
+                for i, q in enumerate(chunk.queries):
+                    if i >= MAX_QUERIES:
+                        pixel_answers.append(sonicsight_pb2.PixelAudio(
+                            query_id=q.query_id,
+                            error=f"query cap ({MAX_QUERIES}) exceeded",
+                        ))
+                        continue
+                    wid = q.window_id
+                    if wid == 0 and frozen and pinned_id is not None:
+                        wid = pinned_id
+                    cache = ring.get(wid)
+                    if cache is None:
+                        pixel_answers.append(sonicsight_pb2.PixelAudio(
+                            query_id=q.query_id,
+                            window_id=q.window_id,
+                            error="window not available (not cached yet, or evicted)",
+                        ))
+                        continue
+                    weights = region_disc(q.x_norm, q.y_norm, q.radius_norm)
+                    w = torch.from_numpy(weights)
+                    # Region + complement, renormed together: the pair
+                    # partitions the mixture (PIXEL_PLAN 2.2). The region
+                    # track is returned; the complement exists so the math
+                    # matches the mixer semantics.
+                    async with self._inference_lock:
+                        wavs, energies = await asyncio.to_thread(
+                            synthesize_regions, engine, cache, [w, 1.0 - w]
+                        )
+                    pcm = (np.clip(wavs[0], -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+                    pixel_answers.append(sonicsight_pb2.PixelAudio(
+                        query_id=q.query_id,
+                        pcm=pcm,
+                        sample_count=len(wavs[0]),
+                        energy=energies[0],
+                        window_id=cache.window_id,
+                    ))
+
+                # Query answers go out IMMEDIATELY — never parked on the next
+                # window result, where an inference failure could drop them
+                # and where the wait would break the "a tap feels instant"
+                # contract. sequence_number=0 keeps them outside the client's
+                # audio gap detection (which tracks only results with seq > 0).
+                if pixel_answers:
+                    newest = ring.newest()
+                    yield sonicsight_pb2.StreamResult(
+                        success=True,
+                        is_buffering=False,
+                        timestamp_ms=chunk.timestamp_ms,
+                        sequence_number=0,
+                        model_id=model_id,
+                        heatmap_count=spec.heatmap_count,
+                        pixel_audio=pixel_answers,
+                        window_id=(
+                            pinned_id if (frozen and pinned_id is not None)
+                            else (newest.window_id if newest else 0)
+                        ),
+                    )
+
+                # ── Window advance (normal-mode windows only) ──
+                yielded_window = False
+                if buffer.has_enough_data():
+                    audio_window, frames, center_timestamp, window_start_sample = (
+                        buffer.get_latest_window()
+                    )
+                    if (
+                        audio_window is not None
+                        and getattr(buffer, "_last_window_mode", "normal") == "normal"
+                        and center_timestamp != last_yielded_timestamp
+                    ):
+                        # Feature pass AND the per-cell map pass hold the same
+                        # lock every other GPU entry point in this servicer
+                        # holds — cell_maps is real GPU work, not bookkeeping.
+                        async with self._inference_lock:
+                            feats = await asyncio.to_thread(
+                                engine.eval_pixel_window, audio_window, frames
+                            )
+                            cache = WindowCache(
+                                window_id=0,  # assigned by the ring
+                                feat_sound=feats["feat_sound"],
+                                feats_img=feats["feats_img"],
+                                mag_lin=feats["mag_lin"],
+                                phase=feats["phase"],
+                                audio_gain=feats["audio_gain"],
+                                start_sample=window_start_sample,
+                                center_timestamp_ms=center_timestamp,
+                            )
+                            energy_map_arr, _activation_map = await asyncio.to_thread(
+                                cell_maps, engine, cache
+                            )
+                        window_id = ring.push(cache)
+                        energy_bytes = smoother.update(energy_map_arr)
+
+                        mix_ola.add_window(
+                            audio_window, start_sample=window_start_sample
+                        )
+                        mix_pcm = mix_ola.drain()
+                        if len(mix_pcm) // 2 > SAFE_DRAIN_SAMPLES:
+                            logger.warning(
+                                "Oversized pixel mixture drain (%d samples) – trimming "
+                                "to protect the client jitter buffer.",
+                                len(mix_pcm) // 2,
+                            )
+                            mix_pcm = mix_pcm[-SAFE_DRAIN_SAMPLES * 2:]
+
+                        yield sonicsight_pb2.StreamResult(
+                            success=True,
+                            is_buffering=False,
+                            timestamp_ms=center_timestamp,
+                            left_audio_pcm=mix_pcm,   # the MIXTURE (mixer baseline)
+                            right_audio_pcm=b"",
+                            left_heatmap=b"",          # energy_map is the only spatial payload
+                            right_heatmap=b"",
+                            sequence_number=seq_number,
+                            audio_sample_count=len(mix_pcm) // 2,
+                            model_id=model_id,
+                            heatmap_count=spec.heatmap_count,
+                            energy_map=energy_bytes,
+                            grid_width=GRID_W,
+                            grid_height=GRID_H,
+                            window_id=window_id,
+                        )
+                        seq_number += 1
+                        last_yielded_timestamp = center_timestamp
+                        yielded_window = True
+
+                if not yielded_window and not pixel_answers and chunks_received % 10 == 0:
+                    # Keepalive on the same cadence as the halves path — sent
+                    # even when a window is already cached, so an audio stall
+                    # never leaves the stream silent for an unbounded time.
+                    yield sonicsight_pb2.StreamResult(
+                        success=True,
+                        is_buffering=True,
+                        timestamp_ms=chunk.timestamp_ms,
+                        model_id=model_id,
+                        heatmap_count=spec.heatmap_count,
+                    )
+
+                if chunk.is_last:
+                    break
+
+            # Release the mixture's held-back crossfade tail, like the halves
+            # path does on stream end.
+            final_mix = mix_ola.flush()
+            if final_mix:
+                yield sonicsight_pb2.StreamResult(
+                    success=True,
+                    is_buffering=False,
+                    timestamp_ms=max(0, last_yielded_timestamp),
+                    left_audio_pcm=final_mix,
+                    sequence_number=seq_number,
+                    audio_sample_count=len(final_mix) // 2,
+                    model_id=model_id,
+                    heatmap_count=spec.heatmap_count,
+                )
+
+        except grpc.aio.AbortError:
+            raise
+        except torch.cuda.OutOfMemoryError:
+            yield sonicsight_pb2.StreamResult(
+                success=False,
+                error_message="GPU out of memory.",
+                model_id=model_id,
+            )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            yield sonicsight_pb2.StreamResult(
+                success=False,
+                error_message=str(e),
+                model_id=model_id,
+            )
 
     async def ProcessVideo(self, request_iterator, context):
         request_id = uuid4().hex
