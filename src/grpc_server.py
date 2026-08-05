@@ -585,6 +585,20 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                         ))
                         continue
                     weights = region_disc(q.x_norm, q.y_norm, q.radius_norm)
+                    # Honest silence: if no cell in the tapped region clears
+                    # the measured contrast gate, say "nothing here" instead
+                    # of synthesizing the ~40%-of-everything leakage a
+                    # background sigmoid produces (calibrated 2026-08-05).
+                    if cache.energy_map is not None:
+                        from clustering import silence_threshold
+                        thr = silence_threshold(cache.energy_map.reshape(-1))
+                        if not (cache.energy_map[weights > 0.5] > thr).any():
+                            pixel_answers.append(sonicsight_pb2.PixelAudio(
+                                query_id=q.query_id,
+                                energy=0.0,
+                                window_id=cache.window_id,
+                            ))
+                            continue
                     w = torch.from_numpy(weights)
                     # Region + complement, renormed together: the pair
                     # partitions the mixture (PIXEL_PLAN 2.2). The region
@@ -661,6 +675,7 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                                     cell_analysis, engine, cache, 28, clusters_on
                                 )
                             )
+                        cache.energy_map = energy_map_arr
                         window_id = ring.push(cache)
                         energy_bytes = smoother.update(energy_map_arr)
 

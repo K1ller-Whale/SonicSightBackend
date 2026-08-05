@@ -63,6 +63,10 @@ class WindowCache:
     start_sample: int             # absolute wire-domain start of the window
     center_timestamp_ms: int
     pinned: bool = False
+    # Per-cell linear energies for this window (set after cell_analysis) —
+    # lets the query path answer "no sound detected here" honestly instead
+    # of synthesizing leakage for a below-floor cell.
+    energy_map: Optional[np.ndarray] = None
 
     def mixture_energy(self) -> float:
         """Total linear-domain energy of the window's mixture (gain undone).
@@ -326,10 +330,18 @@ class EnergyMapSmoother:
         self._peak_hold: float = 0.0
 
     def update(self, energy_map: np.ndarray) -> bytes:
+        # Contrast-normalize before smoothing: background sigmoids give EVERY
+        # cell 30-60% of the peak energy (measured live 2026-08-05), so a raw
+        # map glows uniformly. Subtracting the per-window median shows the
+        # signal above the leakage floor — dark means "no more sound than
+        # anywhere else", which is the honest reading of this model.
+        contrasted = np.clip(
+            energy_map.astype(np.float32) - float(np.median(energy_map)), 0.0, None
+        )
         if self._ema is None:
-            self._ema = energy_map.astype(np.float32).copy()
+            self._ema = contrasted.copy()
         else:
-            self._ema = self.alpha * energy_map + (1.0 - self.alpha) * self._ema
+            self._ema = self.alpha * contrasted + (1.0 - self.alpha) * self._ema
         peak_now = float(self._ema.max())
         self._peak_hold = max(peak_now, self.PEAK_RELEASE * self._peak_hold)
         norm = np.clip(self._ema / max(self._peak_hold, self.PEAK_FLOOR), 0.0, 1.0)

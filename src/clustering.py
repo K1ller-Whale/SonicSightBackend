@@ -37,14 +37,24 @@ SILENCE_LABEL = 255
 # ages out; with <= 3 live tracks the pool never exhausts.
 MAX_TRACK_ID = 254
 
-# ── PROVISIONAL silence thresholds (amendment C2) ──
-# A cell is active when energy > max(SILENCE_ABS_FLOOR, SILENCE_REL_FRAC * max).
-# The relative gate keeps one loud source from silencing everything else at
-# 5%; the absolute floor guards empty rooms. Both UNMEASURED until real-clip
-# distributions are read from the percentile log below — do not trust them
-# past that first measurement session.
+# ── Silence gate constants — MEASURED, first calibration (amendment C2) ──
+# Live session 2026-08-05 (percentile log): p50 ≈ 3-6e4, max ≈ 5e4-1.4e5 on
+# real scenes INCLUDING the grey letterbox bars — every cell carries 30-60%
+# of the peak because background sigmoids sit near 0.3-0.5, not 0. A
+# fraction-of-max gate (the old 5%) therefore never fired: active=196/196
+# on every window. The gate must be CONTRAST-based: active cells stand
+# above the median floor toward the max. 0.35 puts the threshold near p90
+# on the measured distributions (~10-25 active cells for 1-2 sources).
+# Refine from future percentile logs; the log line below stays for that.
 SILENCE_ABS_FLOOR = 1e-3
-SILENCE_REL_FRAC = 0.05
+SILENCE_CONTRAST_FRAC = 0.35
+
+
+def silence_threshold(energy_flat: np.ndarray) -> float:
+    """Contrast gate: median + frac * (max - median), floored."""
+    med = float(np.median(energy_flat))
+    mx = float(energy_flat.max())
+    return max(SILENCE_ABS_FLOOR, med + SILENCE_CONTRAST_FRAC * (mx - med))
 
 # Persistence: a track survives this many windows unmatched before it dies.
 TRACK_MAX_MISSED = 4
@@ -156,7 +166,7 @@ def discover_sources(
     state = state or ClusterState()
 
     energy = energy_map.reshape(-1)
-    threshold = max(SILENCE_ABS_FLOOR, SILENCE_REL_FRAC * float(energy.max()))
+    threshold = silence_threshold(energy)
     active = energy > threshold
 
     # C2 instrumentation: the numbers the provisional thresholds must be
