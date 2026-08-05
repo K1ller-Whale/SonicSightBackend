@@ -112,7 +112,42 @@ an existing one needs **no proto change**. If it genuinely needs a new capture
 format, add fields (never renumber), keep both proto copies byte-identical, and
 regenerate stubs on both sides.
 
-## 5. Validation expectations
+## 5. Region modes on the sonicsight family
+
+`ModelSpec.mode` ("halves" | "pixel") selects how the scene is divided.
+Because the synthesizer is linear over a K-vector, **every spatial selection
+is the same operation**: pool the visual K-vectors over a region (spatial
+MAX — post-sigmoid features + monotonic sigmoid make this exactly the
+deployed video-level pooling restricted to the region), synthesize ONE mask,
+post-process in the deployed order (unwarp → renorm-as-a-set → optional
+binary), apply to the mixture, ISTFT. That primitive is
+`pixel_cache.synthesize_regions(engine, cache, [w_1..w_N])`; regions are
+`[GRID_H, GRID_W]` float weight maps, and the renormed set partitions the
+mixture (mixer-coherent by construction).
+
+The per-window cache (`WindowCache`, ring of 3, freeze-pin exempt from
+eviction) is what makes a tap free: `eval_pixel_window` runs the nets once,
+`cell_analysis` produces the energy map, the validated activation map, and
+the clustering features in one chunked pass.
+
+Query protocol (proto): `PixelQuery` in-band on the stream (the stream owns
+the cache) with normalized letterbox coordinates and `window_id` (0 = newest,
+or the pinned window while the `freeze` TTL latch is held); answers are
+`PixelAudio` with `sequence_number = 0` (outside audio gap detection),
+relative `energy` in 0..1, and an explicit `error` for evicted windows or the
+4-query cap. `request_clusters` (TTL latch) attaches `cluster_labels` +
+`SourceCluster` (persistent ids ≤ 254 — the uint8 label map and the proto
+carry the SAME number; colours are CVD-safe and server-assigned).
+
+**Adding a fourth region mode** (thirds, quadrants, freeform lasso) is a new
+*weight generator*, not a new architecture: fixed geometries (thirds,
+quadrants) need only a server-side mask builder next to `region_disc` and a
+spec/profile entry; freeform lasso would add one proto field (e.g.
+`bytes region_weights`, a uint8 [grid] map in the client's letterbox space)
+feeding `synthesize_regions` unchanged. All are natural extensions of this
+architecture and **explicitly out of scope now**.
+
+## 6. Validation expectations
 
 Before a model ships in the registry, it should have the equivalent of the
 multisensory measurement record: a correctness experiment that would FAIL if

@@ -128,7 +128,51 @@ On a device, against the WSL2 server (portproxy/mirrored networking):
    buffer hairline; TalkBack: every control announced, state changes spoken
    (live regions).
 
+## T7 — Pixel (touch) mode measurements
+
+Everything below the unit level is UNMEASURED for pixel mode: the suites
+prove shapes, orders and contracts (region math vs brute force, partition
+property, ring/pin, clustering persistence, coordinate chain), not model
+output or timing. Run on the WSL2 GPU machine.
+
+1. **Known-cell query vs offline reference (the phase 2 gate).** Run
+   `pixel_ab_harness.py --video <clip> --start S --tap x,y`, then stream the
+   same clip live in touch mode and tap the same normalized point on the
+   same scene. The live `PixelAudio` PCM and the harness `tap_ratio.wav`
+   must match to float tolerance (identical cache math; differences mean a
+   wire or transform bug).
+2. **The listens the design still owes** (report back, decisions pending):
+   A/B halves (crop vs region) — do NOT change the default without saying
+   so; B1 ratio vs binary tap; B2 energy vs activation map side by side.
+3. **Timing/memory, record actuals:**
+
+| measurement | budget | measured |
+|---|---|---|
+| cache per window (log line "pixel cache: … MB") | ~9.5 MB, ring ≤ ~38 MB w/ pin | TBD |
+| eval_pixel_window (feature pass) | ≤ existing SoP inference (~same nets) | TBD |
+| cell_analysis (energy+activation+features) | inside the 125 ms hop | TBD |
+| single query (synthesize_regions pair + istft) | low single-digit ms GPU | TBD |
+| clustering + matching | < 1 ms CPU | TBD |
+| concurrent queries before hop overrun | ≥ 4 (the cap) | TBD |
+
+4. **C2 constants from live logs:** read `pixel energy percentiles …` and
+   `pixel match scores …` lines off a real session; replace
+   SILENCE_ABS_FLOOR / SILENCE_REL_FRAC / MATCH_MIN_SCORE / the client's
+   QUERY_SILENCE_ENERGY with measured values, recording the numbers and the
+   reasoning at each constant.
+
+## T8 — Touch mode end-to-end (the phase 4 gate)
+
+On a device: start in Left-Right, confirm unchanged behaviour; switch to
+Touch; tap a violin → hear the violin (region audio ducks the mixture, the
+tapped CELL lights); drag → one query per cell crossed; freeze → pill shows,
+map pins, taps still answer from the held window (server latch); source
+dots appear on a duet, keep their colours across windows, solo on tap;
+"no sound detected here" on background cells; switch back to Left-Right and
+confirm byte-identical behaviour again. TalkBack: the touch surface and
+source dots are announced.
+
 ---
 
-Order: T1 → T2 → T3 → T4 → T5 → T6. Stop at the first failure; later tests
-assume earlier ones passed.
+Order: T1 → T2 → T3 → T4 → T5 → T6 → T7 → T8. Stop at the first failure;
+later tests assume earlier ones passed.

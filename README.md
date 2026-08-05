@@ -18,10 +18,46 @@ The server hosts **multiple models behind one registry**. The client picks one
 model per stream; that model alone produces both the separated audio and the
 heatmap. There is no fusion, gating, or blending between models.
 
-| model id | separates | streams mean | heatmap | strongest on |
+| model id | separates | streams mean | spatial payload | strongest on |
 |---|---|---|---|---|
-| `sonicsight` | by screen region (Sound of Pixels) | Left / Right half of frame | 2 maps, per-pixel sound energy | music, instruments |
-| `multisensory` | by audio-video alignment (Owens & Efros) | On-screen / Off-screen | 1 map, alignment strength (CAM) | speech |
+| `sonicsight` | by screen halves (Sound of Pixels) | Left / Right half of frame | 2 heatmaps, 56×56 uint8 | music, instruments |
+| `sonicsight-pixel` | by touched region (same checkpoint, touch mode) | Selection / Everything else + mixture | native 14×14 energy map + source clusters | music, instruments |
+| `multisensory` | by audio-video alignment (Owens & Efros) | On-screen / Off-screen | 1 heatmap (CAM), 56×56 uint8 | speech |
+
+## 👆 Touch (pixel) mode
+
+Verified model facts this mode is built on: the visual feature grid is
+**14×14** (stride-16 dilated ResNet-18 on 224×224; only ~14×8 cells carry
+scene content after 16:9 letterboxing), **K = 32** feature channels
+(`NUM_CHANNELS`, not the paper's 16), and the synthesizer is a 33-parameter
+linear inner product — which is why this is cheap:
+
+- The two expensive nets run **once per window** (`eval_pixel_window`); the
+  intermediates are cached (~**9.5 MB/window** fp32: `feat_sound`
+  [1,32,256,256], pooled image features, mixture magnitude+phase; ring of 3
+  ≈ 28 MB, a frozen window pins one extra slot).
+- **Any region's audio is one bmm + sigmoid + unwarp + ISTFT** against the
+  cache (`pixel_cache.synthesize_regions`) — a tap never costs a network
+  forward pass. Regions are renormed as a set in the linear domain (the
+  deployed halves order), so they partition the mixture and faders sum back
+  to the original.
+- The per-cell **energy map** ships at the native grid with explicit
+  `grid_width`/`grid_height` (196 bytes uint8) — the server never resamples
+  up to fake resolution. Source discovery (silence gate → fixed-3 k-means →
+  persistent track ids ≤254 with CVD-safe colours) rides `cluster_labels` +
+  `SourceCluster`.
+- Queries travel **in-band** (`PixelQuery` on the stream that owns the
+  cache), answered with `sequence_number = 0`; `freeze` and
+  `request_clusters` are ~1 s TTL latches. `PixelAudio.energy` is the
+  region's **fraction of window mixture energy** (0..1).
+
+The deployed halves path is untouched by all of this — `mode="halves"` is
+the default and dispatches around the pixel loop entirely. See
+[MODELS.md](MODELS.md) for the region-mode contract and
+[PIXEL_PLAN.md](../PIXEL_PLAN.md) for the full design record.
+`pixel_ab_harness.py` renders the pending listening questions (crop-halves
+vs region-halves, ratio vs binary masks, energy vs activation maps) from a
+fixed clip offline.
 
 Two interfaces:
 1. **gRPC (bidirectional streaming)** — the primary path. `StreamProcess` accepts
