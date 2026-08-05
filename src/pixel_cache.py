@@ -64,6 +64,13 @@ class WindowCache:
     center_timestamp_ms: int
     pinned: bool = False
 
+    def mixture_energy(self) -> float:
+        """Total linear-domain energy of the window's mixture (gain undone).
+        The denominator for RELATIVE region energies: raw sums over 512x256
+        bins are mic-level and window-length dependent, useless as an
+        absolute client-side threshold (review finding)."""
+        return float(((self.mag_lin / self.audio_gain) ** 2).sum().item())
+
     def bytes_estimate(self) -> int:
         return sum(
             t.element_size() * t.nelement()

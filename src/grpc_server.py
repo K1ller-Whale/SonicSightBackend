@@ -499,9 +499,17 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
         SAFE_DRAIN_SAMPLES = int(spec.output_sample_rate * 1.5)
 
         chunks_received = 0
-        seq_number = 0
+        # Window results number from 1: sequence 0 is the reserved marker for
+        # query answers (outside client audio gap detection).
+        seq_number = 1
         last_yielded_timestamp = -1
-        frozen = False        # level-triggered freeze state (rising edge pins)
+        # Freeze is TTL-latched exactly like request_clusters: the client's
+        # audio and frame chunks come from different threads, and a strict
+        # per-chunk level would unpin ~8 times a second on flag-less audio
+        # chunks (review finding). Rising edge pins; TTL expiry is the
+        # falling edge.
+        FREEZE_TTL = 16
+        freeze_ttl = 0
         pinned_id = None
         # Source discovery enable: a TTL latch, not a per-chunk level. The
         # phone's audio and frame chunks are built by different threads, so a
@@ -533,18 +541,20 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                     except Exception as e:
                         logger.info(f"Error decoding frame: {e}")
 
-                # Freeze is LEVEL-triggered on the wire (the client holds it
-                # true while frozen); the pin happens on the rising edge only,
-                # and window_id=0 queries resolve to the pinned window while
-                # frozen — the client never has to guess the server's id.
-                if chunk.freeze and not frozen:
-                    pinned_id = ring.pin_newest()
-                    logger.info("Pixel freeze: pinned window_id=%s", pinned_id)
-                elif not chunk.freeze and frozen:
-                    ring.unpin_all()
-                    pinned_id = None
-                    logger.info("Pixel freeze released")
-                frozen = chunk.freeze
+                # Rising edge pins; while latched, window_id=0 queries resolve
+                # to the pinned window — the client never guesses server ids.
+                if chunk.freeze:
+                    if freeze_ttl == 0:
+                        pinned_id = ring.pin_newest()
+                        logger.info("Pixel freeze: pinned window_id=%s", pinned_id)
+                    freeze_ttl = FREEZE_TTL
+                elif freeze_ttl > 0:
+                    freeze_ttl -= 1
+                    if freeze_ttl == 0:
+                        ring.unpin_all()
+                        pinned_id = None
+                        logger.info("Pixel freeze released")
+                frozen = freeze_ttl > 0
 
                 if chunk.request_clusters:
                     clusters_ttl = CLUSTERS_TTL
@@ -585,11 +595,15 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                             synthesize_regions, engine, cache, [w, 1.0 - w]
                         )
                     pcm = (np.clip(wavs[0], -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+                    # RELATIVE energy: fraction of the window's mixture energy
+                    # captured by the region, 0..1 — scale-free, so the
+                    # client's "no sound detected here" gate is meaningful.
+                    rel_energy = energies[0] / max(cache.mixture_energy(), 1e-12)
                     pixel_answers.append(sonicsight_pb2.PixelAudio(
                         query_id=q.query_id,
                         pcm=pcm,
                         sample_count=len(wavs[0]),
-                        energy=energies[0],
+                        energy=min(1.0, rel_energy),
                         window_id=cache.window_id,
                     ))
 
