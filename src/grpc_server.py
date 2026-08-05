@@ -494,6 +494,11 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
         smoother = EnergyMapSmoother()
 
         MAX_QUERIES = 4  # proto contract; excess answered with an error
+        # One-shot tap answers carry only the TAIL of the analysis window:
+        # the full 5.94 s replay felt like listening to the past twice (user
+        # feedback 2026-08-05); the last 2 s keeps the answer recent while
+        # the window's full context still shaped the mask.
+        TAP_TAIL_SECONDS = 2.0
         # Safety net shared with the halves path: never hand the phone more
         # than its ~1.5 s jitter buffer in one drain.
         SAFE_DRAIN_SAMPLES = int(spec.output_sample_rate * 1.5)
@@ -521,6 +526,10 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
         CLUSTERS_TTL = 16
         clusters_ttl = 0
         cluster_state = None  # label persistence across windows
+        # Sticky follow: when set, every window's left_audio_pcm carries this
+        # region's audio (synthesized fresh per window, OLA-stitched) instead
+        # of the mixture — live listening to a spot, not a replay.
+        sticky_weights = None
 
         try:
             async for chunk in request_iterator:
@@ -564,9 +573,17 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                         cluster_state = None  # falling edge: no stale revivals
                 clusters_on = clusters_ttl > 0
 
+                if chunk.clear_sticky:
+                    sticky_weights = None
+
                 # ── Answer queries against the cache (no inference) ──
                 pixel_answers = []
                 for i, q in enumerate(chunk.queries):
+                    if q.sticky:
+                        # Sets/replaces the followed region; no one-shot
+                        # answer — the live stream itself becomes the answer.
+                        sticky_weights = region_disc(q.x_norm, q.y_norm, q.radius_norm)
+                        continue
                     if i >= MAX_QUERIES:
                         pixel_answers.append(sonicsight_pb2.PixelAudio(
                             query_id=q.query_id,
@@ -608,7 +625,10 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                         wavs, energies = await asyncio.to_thread(
                             synthesize_regions, engine, cache, [w, 1.0 - w]
                         )
-                    pcm = (np.clip(wavs[0], -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+                    # Tail slice: answer with the most recent seconds only.
+                    tail = int(TAP_TAIL_SECONDS * spec.output_sample_rate)
+                    region_tail = wavs[0][-tail:]
+                    pcm = (np.clip(region_tail, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
                     # RELATIVE energy: fraction of the window's mixture energy
                     # captured by the region, 0..1 — scale-free, so the
                     # client's "no sound detected here" gate is meaningful.
@@ -616,7 +636,7 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                     pixel_answers.append(sonicsight_pb2.PixelAudio(
                         query_id=q.query_id,
                         pcm=pcm,
-                        sample_count=len(wavs[0]),
+                        sample_count=len(region_tail),
                         energy=min(1.0, rel_energy),
                         window_id=cache.window_id,
                     ))
@@ -679,6 +699,22 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                         window_id = ring.push(cache)
                         energy_bytes = smoother.update(energy_map_arr)
 
+                        # Sticky follow: the live audio out becomes the
+                        # followed region's synthesis for THIS window; the
+                        # OLA's timeline-driven stitching handles the seam
+                        # whenever the source (mixture <-> region) switches.
+                        window_audio_out = audio_window
+                        if sticky_weights is not None:
+                            async with self._inference_lock:
+                                sticky_wavs, _ = await asyncio.to_thread(
+                                    synthesize_regions,
+                                    engine,
+                                    cache,
+                                    [torch.from_numpy(sticky_weights),
+                                     1.0 - torch.from_numpy(sticky_weights)],
+                                )
+                            window_audio_out = sticky_wavs[0]
+
                         cluster_labels_bytes = b""
                         cluster_protos = []
                         if clusters_on and cell_feats is not None:
@@ -698,7 +734,7 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                             ]
 
                         mix_ola.add_window(
-                            audio_window, start_sample=window_start_sample
+                            window_audio_out, start_sample=window_start_sample
                         )
                         mix_pcm = mix_ola.drain()
                         if len(mix_pcm) // 2 > SAFE_DRAIN_SAMPLES:
