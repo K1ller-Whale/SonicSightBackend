@@ -1,0 +1,6 @@
+{
+  "pid": 26124,
+  "port": 50051,
+  "started_utc": "2026-08-08T14:24:45Z",
+  "loop_lag_csv": "loadtest\\results\\current\\loop_lag.csv"
+}

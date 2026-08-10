@@ -1,4 +1,4 @@
-"""Asyncio session driver on the project's own generated stubs.
+﻿"""Asyncio session driver on the project's own generated stubs.
 
 Why a custom driver (the brief's tool question, answered): the service is
 gRPC *bidirectional streaming* with in-band control fields (pixel queries,
@@ -45,7 +45,7 @@ for _id, _spec in REGISTRY.items():
 
 
 class SessionStats:
-    """Per-session recorder; all timestamps are time.monotonic() seconds."""
+    """Per-session recorder; all timestamps are time.perf_counter() seconds."""
 
     def __init__(self, session_id, profile):
         self.session_id = session_id
@@ -160,7 +160,7 @@ async def chunk_stream(stats, source, duration_s, queries_per_s=0.0,
     audio_field = prof["audio_field"]
 
     n_ticks = int(duration_s * 1000.0 / tick_ms)
-    t0 = time.monotonic()
+    t0 = time.perf_counter()
     next_frame_at = 0.0
     frame_idx = 0
     next_query_at = 1.0 / queries_per_s if queries_per_s > 0 else None
@@ -170,7 +170,7 @@ async def chunk_stream(stats, source, duration_s, queries_per_s=0.0,
         if stop_event is not None and stop_event.is_set():
             break
         target = t0 + i * tick_ms / 1000.0
-        delay = target - time.monotonic()
+        delay = target - time.perf_counter()
         if delay > 0:
             await asyncio.sleep(delay)
 
@@ -186,12 +186,12 @@ async def chunk_stream(stats, source, duration_s, queries_per_s=0.0,
             chunk.queries.append(sonicsight_pb2.PixelQuery(
                 query_id=qid, x_norm=0.5, y_norm=0.5, radius_norm=0.15,
                 window_id=0))
-            stats.query_send_times[qid] = time.monotonic()
+            stats.query_send_times[qid] = time.perf_counter()
 
         if inject is not None:
             chunk = inject(i, chunk)
         if chunk is not None:
-            stats.record_audio_sent(ts_ms, time.monotonic())
+            stats.record_audio_sent(ts_ms, time.perf_counter())
             yield chunk
 
         # catch-up loop: emit every frame due by now (a 30 fps profile has
@@ -228,7 +228,7 @@ async def run_session(host, port, model_id, source, duration_s,
     stub = sonicsight_pb2_grpc.SonicSightServiceStub(channel)
     metadata = ((MODEL_METADATA_KEY, model_id),)
 
-    stats.t_open = time.monotonic()
+    stats.t_open = time.perf_counter()
     call = stub.StreamProcess(
         chunk_stream(stats, source, duration_s, queries_per_s, inject,
                      stop_event),
@@ -244,7 +244,7 @@ async def run_session(host, port, model_id, source, duration_s,
                    if abrupt_cancel_after_s is not None else None)
     try:
         async for r in call:
-            now = time.monotonic()
+            now = time.perf_counter()
             for pa in r.pixel_audio:
                 sent = stats.query_send_times.get(pa.query_id)
                 if sent is not None:
@@ -285,3 +285,4 @@ async def health_check(host, port):
                 "loaded_models": list(resp.loaded_models)}
     finally:
         await channel.close()
+

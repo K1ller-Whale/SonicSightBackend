@@ -10,6 +10,7 @@ cycle counts) are scenario arguments, not thresholds.
 """
 
 import asyncio
+import datetime
 import math
 import os
 import re
@@ -35,6 +36,45 @@ def _target_field(doc, target_id, field, default=None):
     return doc["targets"][target_id].get(field, default)
 
 
+_LOG_TS = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),(\d{3})")
+
+
+def _server_log_since(path, t0):
+    """Server-log text limited to lines emitted at or after epoch `t0`.
+
+    Log-based metrics must describe THIS run, not the server's whole
+    lifetime. Two concrete failures motivate the scoping, both observed:
+
+    1. On E-D the registry deliberately tolerates the multisensory engine
+       failing to import TensorFlow and logs it with exc_info, so the log
+       always opens with a benign "Traceback (most recent call last)".
+       An unscoped scan counts it as an unhandled exception and every
+       run using --server-log fails NFR-REL-005 for a designed behaviour.
+    2. The wrapper's server is long-lived across scenarios, so unscoped
+       counts accumulate: each run inherits every earlier run's events.
+
+    Lines carry logging's local-time %(asctime)s; unstamped lines
+    (traceback bodies, library warnings) inherit the most recent stamp, so
+    a traceback is attributed to the record that emitted it. Text before
+    the first stamped record is startup noise and is dropped.
+    """
+    text = open(path, "r", encoding="utf-8", errors="replace").read()
+    if not t0:
+        return text
+    start = datetime.datetime.fromtimestamp(t0)
+    kept, keeping = [], False
+    for line in text.splitlines(keepends=True):
+        m = _LOG_TS.match(line)
+        if m:
+            stamp = datetime.datetime.strptime(
+                m.group(1), "%Y-%m-%d %H:%M:%S").replace(
+                    microsecond=int(m.group(2)) * 1000)
+            keeping = stamp >= start
+        if keeping:
+            kept.append(line)
+    return "".join(kept)
+
+
 def _session_meets_cadence(doc, stats):
     dev_p95 = metrics.percentile(stats.cadence_abs_dev_ms(), 95)
     if dev_p95 is None:
@@ -44,16 +84,25 @@ def _session_meets_cadence(doc, stats):
 
 
 def _session_meets_cadence_and_cycle(doc, stats):
-    """Per-session NFR-PERF-003 + NFR-PERF-004 check, thresholds from YAML."""
+    """Per-session NFR-PERF-003 + NFR-PERF-004 check. Thresholds AND the
+    set of statistics come from the YAML, so a reconciliation that changes
+    PERF-004's statistics (e.g. max -> p99) needs no code change here."""
     srv = stats.server_times_ms()
-    srv_p95 = metrics.percentile(srv, 95)
-    if srv_p95 is None:
+    if not srv:
         return False
-    return (_session_meets_cadence(doc, stats)
-            and srv_p95 <= _assertion_value(
-                doc, "NFR-PERF-004", "total_server_time_ms", "p95")
-            and max(srv) <= _assertion_value(
-                doc, "NFR-PERF-004", "total_server_time_ms", "max"))
+    if not _session_meets_cadence(doc, stats):
+        return False
+    for a in doc["targets"]["NFR-PERF-004"]["assertions"]:
+        stat = a["statistic"]
+        if stat == "max":
+            got = max(srv)
+        elif stat.startswith("p") and stat[1:].isdigit():
+            got = metrics.percentile(srv, int(stat[1:]))
+        else:
+            continue
+        if not nfr._OPS[a["op"]](got, a["value"]):
+            return False
+    return True
 
 
 GAP_WINDOW_S = 300.0  # NFR-PERF-013's "consecutive non-overlapping 5-min
@@ -121,7 +170,8 @@ def _aggregate_single(stats_list, doc):
             "p95": metrics.percentile(devs, 95)}
     if srv:
         measured["total_server_time_ms"] = {
-            "p95": metrics.percentile(srv, 95), "max": max(srv)}
+            "p95": metrics.percentile(srv, 95),
+            "p99": metrics.percentile(srv, 99), "max": max(srv)}
     gap = _gap_rate_windows(stats_list)
     if gap is not None:
         measured["sequence_gap_rate"] = {"proportion": gap}
@@ -396,9 +446,14 @@ def soak(args, doc, ctx):
         if warm:
             measured["gpu_memory_growth_after_5min"] = {
                 "max": max(warm) - min(warm)}
+    if mon is not None:
+        # NFR-SEC-001 (soak added to its scenario list): endpoints observed
+        # on the server process over the whole sustained session.
+        measured["non_lan_endpoints_contacted"] = {
+            "count": mon.non_lan_endpoint_count(
+                lan_hosts=("127.0.0.1", "::1", args.host))}
     if args.server_log and os.path.exists(args.server_log):
-        text = open(args.server_log, "r", encoding="utf-8",
-                    errors="replace").read()
+        text = _server_log_since(args.server_log, ctx.get("run_start_epoch"))
         measured["unhandled_exceptions_in_logs"] = {
             "count": len(re.findall(r"Traceback \(most recent call last\)", text))}
         splice = re.findall(r"ola_splice_fallbacks'?\s*[=:]\s*(\d+)", text)
@@ -594,8 +649,8 @@ def failure(args, doc, ctx):
         if gpu0 is not None and gpu1 is not None:
             measured["gpu_memory_delta_vs_baseline"] = {"max": gpu1 - gpu0}
         if args.server_log and os.path.exists(args.server_log):
-            text = open(args.server_log, encoding="utf-8",
-                        errors="replace").read()
+            text = _server_log_since(args.server_log,
+                                     ctx.get("run_start_epoch"))
             opens = len(re.findall(args.open_marker, text))
             closes = (len(re.findall(args.close_marker, text))
                       if args.close_marker else None)
