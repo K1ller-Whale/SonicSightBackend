@@ -146,10 +146,23 @@ MULTISENSORY_SPEC = ModelSpec(
     heatmap_count=1,
     stream_labels=("On-screen", "Off-screen"),   # NEVER "Left / Right" on this branch
     confidence_gated=True,
-    window_min_advance=5512,                     # = hop: at 30 fps every frame offers a
-                                                 # newer window; without this the 250 ms
-                                                 # hop is never honoured and inference
-                                                 # runs back-to-back at ~150 ms
+    window_min_advance=5376,                     # ~= hop, rounded DOWN to a multiple of
+                                                 # the 256-sample STFT alignment grid.
+                                                 # At 30 fps every frame offers a newer
+                                                 # window; without a minimum advance the
+                                                 # 250 ms hop is never honoured and
+                                                 # inference runs back-to-back at ~150 ms.
+                                                 # It must be a 256 multiple because the
+                                                 # buffer snaps window starts down to
+                                                 # that grid (inference.py): with the
+                                                 # former value 5512, the +5512 candidate
+                                                 # snapped to +5376 (< 5512) and was
+                                                 # rejected every time, so the effective
+                                                 # stride was +8192 = 371.5 ms — measured
+                                                 # as interval p50 373.5 ms (defect
+                                                 # D-P5-1, ANALYSIS_REPORT 10.4). 5376 =
+                                                 # 21*256 = 243.8 ms: reachable, and the
+                                                 # closest grid stride to the 250 ms hop.
 )
 
 
