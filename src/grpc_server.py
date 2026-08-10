@@ -66,6 +66,16 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                 f"Model '{model_id}' is not loaded on this server.",
             )
 
+        # Close-side counterpart of the "Client connected" lines below and in
+        # _pixel_stream: fires on EVERY termination (clean end, client cancel,
+        # in-stream error) once the stream got past model resolution, so
+        # open/close log-line parity is the orphaned-loop detector NFR-REL-002
+        # requires (defect D-P5-4: no close line existed before 2026-08-10).
+        # Registered after the abort checks: aborted streams log neither side.
+        context.add_done_callback(
+            lambda _ctx: logger.info(
+                "Stream closed for StreamProcess (model=%s).", model_id))
+
         # Pixel mode gets its own loop: cache-and-query architecture, no
         # left/right synthesis. The halves/multisensory path below is not
         # shared with it and stays byte-identical.

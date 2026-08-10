@@ -81,8 +81,8 @@ def _server_log_since(path, t0):
 # PERF-003/004 would assert the wrong requirement. The pairing is the only
 # model-dispatch here; every value still comes from the YAML.
 _SESSION_TARGETS = {
-    "multisensory": ("NFR-PERF-002", "NFR-PERF-005",
-                     "sessions_meeting_perf_002_and_005"),
+    "multisensory": ("NFR-PERF-015", "NFR-PERF-005",
+                     "sessions_meeting_perf_015_and_005"),
 }
 _SESSION_TARGETS_DEFAULT = ("NFR-PERF-003", "NFR-PERF-004",
                             "sessions_meeting_perf_003_and_004")
@@ -836,7 +836,7 @@ def smoke(args, doc, ctx):
         # NFR-FLEX-001's E-M half: on a TensorFlow-capable host the full
         # registry must serve. Emitted unconditionally; the assertion is
         # e-m-conditional in the YAML so E-D runs still report it skipped.
-        measured["models_served_on_e_m"] = {"count": len(served)}
+        measured["models_served_on_e_m_class_with_tf"] = {"count": len(served)}
         # "exactly": the served set must be one of the two legitimate
         # states of the registry — all models, or all minus multisensory —
         # and the any-loaded flag must agree.
