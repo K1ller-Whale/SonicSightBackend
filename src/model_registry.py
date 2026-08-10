@@ -146,23 +146,30 @@ MULTISENSORY_SPEC = ModelSpec(
     heatmap_count=1,
     stream_labels=("On-screen", "Off-screen"),   # NEVER "Left / Right" on this branch
     confidence_gated=True,
-    window_min_advance=5376,                     # ~= hop, rounded DOWN to a multiple of
-                                                 # the 256-sample STFT alignment grid.
-                                                 # At 30 fps every frame offers a newer
-                                                 # window; without a minimum advance the
-                                                 # 250 ms hop is never honoured and
-                                                 # inference runs back-to-back at ~150 ms.
-                                                 # It must be a 256 multiple because the
-                                                 # buffer snaps window starts down to
-                                                 # that grid (inference.py): with the
-                                                 # former value 5512, the +5512 candidate
-                                                 # snapped to +5376 (< 5512) and was
-                                                 # rejected every time, so the effective
-                                                 # stride was +8192 = 371.5 ms — measured
-                                                 # as interval p50 373.5 ms (defect
-                                                 # D-P5-1, ANALYSIS_REPORT 10.4). 5376 =
-                                                 # 21*256 = 243.8 ms: reachable, and the
-                                                 # closest grid stride to the 250 ms hop.
+    window_min_advance=4480,                     # Runaway guard sized BELOW the hop by
+                                                 # the candidate slack (defect D-P5-1).
+                                                 # Without a minimum advance, 30 fps
+                                                 # frames offer a newer window after
+                                                 # every frame and inference runs
+                                                 # back-to-back at ~150 ms. But window
+                                                 # candidates land on the 2756-sample
+                                                 # audio-chunk grid MINUS up to ~990
+                                                 # samples of slack (frame timestamps
+                                                 # quantise to 735 samples at 30 fps,
+                                                 # and starts snap down to the
+                                                 # 256-sample STFT grid), so a guard at
+                                                 # the hop itself (the old 5512, or
+                                                 # 5376) rejects the 2-chunk candidate
+                                                 # ~2/3 of the time and the served
+                                                 # stride degrades to 3 chunks =
+                                                 # 371.5 ms (measured p50 373.5,
+                                                 # stride-dump histograms). 4480 =
+                                                 # 5512 - 1032 clears the worst-case
+                                                 # slack so every 2-chunk candidate
+                                                 # (the 250 ms design hop) is accepted,
+                                                 # while still forbidding the 1-chunk
+                                                 # (125 ms) runaway. Effective pacing
+                                                 # stays chunk-grid-quantised: 250 ms.
 )
 
 
