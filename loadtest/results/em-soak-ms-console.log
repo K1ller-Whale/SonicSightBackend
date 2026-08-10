@@ -1,0 +1,2 @@
+run 20260810T100449Z-soak: 1 failing assertion(s), 1 not-measured; results: loadtest/results/em-soak-ms/results.json
+  WARNING not-measured: NFR-REL-005 splice_fallback_rate/proportion — a masked defect, not a pass

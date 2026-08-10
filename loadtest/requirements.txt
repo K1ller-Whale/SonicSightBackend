@@ -1,0 +1,7 @@
+# Load-suite extras on top of the backend requirements.
+# (README references this file; it was missing until 2026-08-10.)
+psutil>=5.9
+PyYAML>=6.0
+pytest>=8.0
+numpy
+Pillow

@@ -1,0 +1,23 @@
+07:26:53 START em-baseline
+07:38:54 DONE em-baseline exit=2
+07:38:54 START em-baseline-pixel
+07:50:54 DONE em-baseline-pixel exit=0
+07:50:54 START em-baseline-ms
+08:02:57 DONE em-baseline-ms exit=1
+08:02:57 START em-load
+08:15:00 DONE em-load exit=1
+08:15:00 START em-load-ms
+08:27:02 DONE em-load-ms exit=1
+08:27:03 START em-stress
+08:48:08 DONE em-stress exit=0
+08:48:08 START em-stress-ms
+08:55:12 DONE em-stress-ms exit=0
+08:55:12 START em-spike
+08:58:00 DONE em-spike exit=0
+08:58:00 START em-switching-ms
+09:16:10 DONE em-switching-ms exit=0
+09:16:10 START em-failure
+10:04:49 DONE em-failure exit=2
+10:04:49 START em-soak-ms
+10:34:53 DONE em-soak-ms exit=1
+10:34:53 CAMPAIGN-COMPLETE

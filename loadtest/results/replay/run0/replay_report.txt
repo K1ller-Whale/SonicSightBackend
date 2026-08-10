@@ -1,0 +1,41 @@
+
+=== STREAM SUMMARY ===
+  wall time        : 19.0 s
+  audio chunks sent: 152
+  frame chunks sent: 152
+  results received : 106  (buffering 31, errors 0)
+  samples returned : 144531  (13.11 s)
+  input streamed   : 209456  (19.00 s)
+  output/input     : 0.690  (1.0 = every input sample came back)
+  heatmap max      : mean 0.9826  (1.000 everywhere = saturated)
+  heatmap min      : mean 0.0033
+
+=== SEPARATION METRICS (compare to your /predict run) ===
+  reference /predict on this clip:
+      pearson +0.263 | flatness L 0.114 R 0.205 | rms ratio 0.936
+
+  duration        : 13.11 s
+  rms L / R       : 0.025412 / 0.025014   ratio 1.016
+  flatness L / R  : 0.3575 / 0.3505   (1.0 = white noise, <0.25 = tonal)
+  pearson(L,R)    : +0.961092            (lower = better separation)
+  spec corr       : +0.957190
+  implied maskL   : mean 0.5023 std 0.0526
+  frac bins 0.4-0.6: 0.9411   (high = 50/50 split = NOT separating)
+
+  band split (% of each band's energy going L / R):
+        0-  150 Hz   L  51.52   R  48.48
+      150-  300 Hz   L  45.65   R  54.35
+      300-  600 Hz   L  47.93   R  52.07
+      600- 1200 Hz   L  55.24   R  44.76
+     1200- 2400 Hz   L  56.48   R  43.52
+     2400- 5512 Hz   L  56.11   R  43.89
+
+=== INPUT SANITY (should look like clean music, NOT like the mic) ===
+  streamed mixture: flatness 0.3465 | 150-600 Hz 58.2% | 2400+ Hz 6.4%
+  clean reference : flatness 0.183 | 150-600 Hz 81.0% | 2400+ Hz  1.0%
+  phone mic (bad) : flatness 0.588 | 150-600 Hz 11.0% | 2400+ Hz 43.3%
+
+=== VERDICT ===
+  Clean input but separation still poor -> a REAL streaming bug
+  remains, and this run reproduces it deterministically. Send me
+  replay_report.txt plus the three wavs.
