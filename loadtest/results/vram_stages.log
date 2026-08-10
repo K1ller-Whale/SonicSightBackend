@@ -1,0 +1,12 @@
+07:26:53 idle-warm-server 894 MiB, 5073 MiB, 9 %
+07:38:54 after-em-baseline 1518 MiB, 4449 MiB, 0 %
+07:50:54 after-em-baseline-pixel 1516 MiB, 4451 MiB, 0 %
+08:02:57 after-em-baseline-ms 2040 MiB, 3927 MiB, 0 %
+08:15:00 after-em-load 2273 MiB, 3694 MiB, 2 %
+08:27:02 after-em-load-ms 2295 MiB, 3672 MiB, 0 %
+08:48:08 after-em-stress 2398 MiB, 3569 MiB, 0 %
+08:55:12 after-em-stress-ms 2395 MiB, 3572 MiB, 1 %
+08:58:00 after-em-spike 2515 MiB, 3452 MiB, 0 %
+09:16:10 after-em-switching-ms 2537 MiB, 3430 MiB, 1 %
+10:04:49 after-em-failure 2622 MiB, 3345 MiB, 5 %
+10:34:53 after-em-soak-ms 2650 MiB, 3317 MiB, 0 %

@@ -67,6 +67,8 @@ class SessionStats:
         self.query_send_times = {}    # query_id -> monotonic send time
         self._audio_ts = []           # sorted capture timestamps (ms)
         self._audio_sent_at = {}      # timestamp_ms -> monotonic send time
+        self.contract_checked = 0     # multisensory structural contract
+        self.contract_violations = 0  # (NFR-FUNC-002); 0/0 elsewhere
 
     def record_audio_sent(self, ts_ms, t_mono):
         self._audio_ts.append(ts_ms)
@@ -96,6 +98,8 @@ class SessionStats:
             # it is not a window result and must not enter cadence math.
         if self.t_first_nonbuffering is None:
             self.t_first_nonbuffering = now
+        if self.profile["model_id"] == "multisensory":
+            self._check_multisensory_contract(r)
         # sequence numbering: halves numbers windows from 0, pixel from 1,
         # and the final flush result is unnumbered (0) — count gaps only
         # across strictly increasing pairs.
@@ -119,6 +123,23 @@ class SessionStats:
             "audio_samples": r.audio_sample_count,
             "audio_age_ms": lag_ms,
         })
+
+    def _check_multisensory_contract(self, r):
+        """NFR-FUNC-002 structural contract, one check per non-buffering
+        result: model echo, single 56x56 heatmap (or gate-empty), CAM
+        confidence in [0,1], fg/bg channels not byte-identical. Semantic
+        separation quality is deliberately NOT asserted here."""
+        self.contract_checked += 1
+        ok = (r.model_id == "multisensory"
+              and r.heatmap_count == 1
+              and len(r.right_heatmap) == 0
+              and len(r.left_heatmap) in (0, 3136)
+              and 0.0 <= r.cam_confidence <= 1.0)
+        if (ok and r.left_audio_pcm and r.right_audio_pcm
+                and r.left_audio_pcm == r.right_audio_pcm):
+            ok = False
+        if not ok:
+            self.contract_violations += 1
 
     # ── derived metrics ────────────────────────────────────────────────
     def time_to_first_nonbuffering(self):
