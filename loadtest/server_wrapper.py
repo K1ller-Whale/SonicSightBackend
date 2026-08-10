@@ -23,6 +23,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import time
 
 from . import paths  # noqa: F401  (sys.path bootstrap)
@@ -33,6 +34,8 @@ from . import paths  # noqa: F401  (sys.path bootstrap)
 # would be dropped. Same format as src/run_servers.py.
 logging.basicConfig(
     level=logging.INFO,
+    stream=sys.stdout,  # stdout keeps PowerShell 5.1 from wrapping every
+    # line in a NativeCommandError record when the window is piped/teed
     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 import grpc_server  # noqa: E402  — the unmodified server module

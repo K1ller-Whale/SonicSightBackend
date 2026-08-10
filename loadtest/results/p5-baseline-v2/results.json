@@ -1,0 +1,393 @@
+{
+  "run_id": "20260809T113939Z-baseline",
+  "meta": {
+    "timestamp_utc": "2026-08-09T11:51:38Z",
+    "scenario": "baseline",
+    "params": {
+      "scenario": "baseline",
+      "host": "127.0.0.1",
+      "port": 50051,
+      "model": "sonicsight",
+      "environment": "E-D",
+      "duration": 420.0,
+      "runs": 20,
+      "ttfr_probe_seconds": 15.0,
+      "sessions": 2,
+      "stagger": 1.0,
+      "max_sessions": 6,
+      "step_duration": 420.0,
+      "burst_sessions": 4,
+      "cycles": 100,
+      "cycle_duration": 10.0,
+      "models": "sonicsight,sonicsight-pixel",
+      "injections": "",
+      "injection_duration": 330.0,
+      "disconnect_cycles": 50,
+      "disconnect_after": 10.0,
+      "settle_seconds": 30.0,
+      "video": null,
+      "replay_runs": 3,
+      "server_info": "loadtest\\results\\current\\server.json",
+      "server_log": null,
+      "open_marker": "Client connected for StreamProcess",
+      "close_marker": null,
+      "offline": false,
+      "out": "loadtest\\results\\p5-baseline-v2"
+    },
+    "git": {
+      "SonicSightBackend": {
+        "head": "1a1842a8d159a96625052de8899093943892d4de",
+        "branch": "main",
+        "dirty": true
+      },
+      "SonicSightMobile": {
+        "head": "cfbe64f096c85f3902535f7c98793e537df85c77",
+        "branch": "master",
+        "dirty": false
+      }
+    },
+    "checkpoints": {
+      "frame_best.pth": {
+        "bytes": 45356134,
+        "sha256_16": "33b22fb447eaa10e"
+      },
+      "sound_best.pth": {
+        "bytes": 121145339,
+        "sha256_16": "c1d45b3a9cb469db"
+      },
+      "synthesizer_best.pth": {
+        "bytes": 652,
+        "sha256_16": "fa29d150d72a8c7b"
+      }
+    },
+    "host": {
+      "platform": "Windows-10-10.0.26200-SP0",
+      "machine": "AMD64",
+      "node": "DESKTOP-RF4V9RH",
+      "python": "3.11.9"
+    },
+    "gpu": "NVIDIA GeForce GTX 1650, 595.97, 4096 MiB",
+    "nfr_targets_yaml": {
+      "bytes": 25614,
+      "sha256_16": "afe89a851eb00392"
+    },
+    "torch": {
+      "version": "2.6.0+cu124",
+      "cuda": "12.4"
+    },
+    "grpcio": "1.78.0"
+  },
+  "wall_seconds": 718.8983964920044,
+  "measured": {
+    "time_to_first_nonbuffering_result": {
+      "p95": 6.338359535003112
+    },
+    "inter_result_interval_abs_dev_from_125ms": {
+      "p95": 18.013137872757166
+    },
+    "total_server_time_ms": {
+      "p95": 50.0,
+      "p99": 58.0,
+      "max": 328
+    },
+    "sequence_gap_rate": {
+      "proportion": 0.0
+    },
+    "event_loop_lag": {
+      "p99": 13.0,
+      "max": 44.0
+    }
+  },
+  "assertions": [
+    {
+      "id": "NFR-PERF-001",
+      "metric": "time_to_first_nonbuffering_result",
+      "statistic": "p95",
+      "op": "<=",
+      "target": 8.0,
+      "unit": "s",
+      "measured": 6.338359535003112,
+      "outcome": "pass"
+    },
+    {
+      "id": "NFR-PERF-003",
+      "metric": "inter_result_interval_abs_dev_from_125ms",
+      "statistic": "p95",
+      "op": "<=",
+      "target": 62.5,
+      "unit": "ms",
+      "measured": 18.013137872757166,
+      "outcome": "pass"
+    },
+    {
+      "id": "NFR-PERF-004",
+      "metric": "total_server_time_ms",
+      "statistic": "p95",
+      "op": "<=",
+      "target": 140,
+      "unit": "ms",
+      "measured": 50.0,
+      "outcome": "pass"
+    },
+    {
+      "id": "NFR-PERF-004",
+      "metric": "total_server_time_ms",
+      "statistic": "max",
+      "op": "<=",
+      "target": 500,
+      "unit": "ms",
+      "measured": 328,
+      "outcome": "pass"
+    },
+    {
+      "id": "NFR-PERF-006",
+      "metric": "event_loop_lag",
+      "statistic": "p99",
+      "op": "<=",
+      "target": 100,
+      "unit": "ms",
+      "measured": 13.0,
+      "outcome": "pass"
+    },
+    {
+      "id": "NFR-PERF-006",
+      "metric": "event_loop_lag",
+      "statistic": "max",
+      "op": "<=",
+      "target": 500,
+      "unit": "ms",
+      "measured": 44.0,
+      "outcome": "pass"
+    },
+    {
+      "id": "NFR-PERF-008",
+      "outcome": "condition-mismatch",
+      "reason": "target specifies model=sonicsight-pixel, run used sonicsight"
+    },
+    {
+      "id": "NFR-PERF-013",
+      "metric": "sequence_gap_rate",
+      "statistic": "proportion",
+      "op": "<=",
+      "target": 0.005,
+      "unit": "ratio",
+      "measured": 0.0,
+      "outcome": "pass"
+    },
+    {
+      "id": "NFR-FUNC-001",
+      "metric": "replay_left_right_pearson",
+      "statistic": "max_over_runs",
+      "op": "<=",
+      "target": 0.35,
+      "unit": "correlation",
+      "measured": null,
+      "outcome": "not-measured"
+    },
+    {
+      "id": "NFR-PERF-002",
+      "outcome": "skipped",
+      "reason": "e-m-conditional: requires an E-M-class host (TensorFlow)"
+    },
+    {
+      "id": "NFR-PERF-005",
+      "outcome": "skipped",
+      "reason": "e-m-conditional: requires an E-M-class host (TensorFlow)"
+    },
+    {
+      "id": "NFR-FUNC-002",
+      "outcome": "skipped",
+      "reason": "e-m-conditional: requires an E-M-class host (TensorFlow)"
+    },
+    {
+      "id": "NFR-FUNC-003",
+      "outcome": "not-evaluable-by-this-suite",
+      "reason": "scenario(s) ['unit'] are outside the load suite (unit/inspection/analysis/mobile)"
+    },
+    {
+      "id": "NFR-INT-001",
+      "outcome": "not-evaluable-by-this-suite",
+      "reason": "scenario(s) ['mobile-instrumented'] are outside the load suite (unit/inspection/analysis/mobile)"
+    },
+    {
+      "id": "NFR-INT-002",
+      "outcome": "not-evaluable-by-this-suite",
+      "reason": "scenario(s) ['unit'] are outside the load suite (unit/inspection/analysis/mobile)"
+    },
+    {
+      "id": "NFR-INT-003",
+      "outcome": "not-evaluable-by-this-suite",
+      "reason": "scenario(s) ['mobile-accessibility'] are outside the load suite (unit/inspection/analysis/mobile)"
+    },
+    {
+      "id": "NFR-INT-004",
+      "outcome": "not-evaluable-by-this-suite",
+      "reason": "scenario(s) ['unit'] are outside the load suite (unit/inspection/analysis/mobile)"
+    },
+    {
+      "id": "NFR-SEC-002",
+      "outcome": "not-evaluable-by-this-suite",
+      "reason": "scenario(s) ['inspection'] are outside the load suite (unit/inspection/analysis/mobile)"
+    },
+    {
+      "id": "NFR-MAINT-002",
+      "outcome": "not-evaluable-by-this-suite",
+      "reason": "scenario(s) ['analysis'] are outside the load suite (unit/inspection/analysis/mobile)"
+    },
+    {
+      "id": "NFR-MAINT-003",
+      "outcome": "not-evaluable-by-this-suite",
+      "reason": "scenario(s) ['unit'] are outside the load suite (unit/inspection/analysis/mobile)"
+    },
+    {
+      "id": "NFR-FLEX-002",
+      "outcome": "not-evaluable-by-this-suite",
+      "reason": "scenario(s) ['mobile-matrix'] are outside the load suite (unit/inspection/analysis/mobile)"
+    },
+    {
+      "id": "NFR-FLEX-003",
+      "outcome": "not-evaluable-by-this-suite",
+      "reason": "scenario(s) ['mobile-matrix'] are outside the load suite (unit/inspection/analysis/mobile)"
+    }
+  ],
+  "extras": {
+    "time_to_first_nonbuffering_s": {
+      "count": 21,
+      "mean": 6.247298985715523,
+      "min": 5.943515699997079,
+      "max": 8.103821200013044,
+      "p50": 6.169702099999995,
+      "p90": 6.244002100007492,
+      "p95": 6.245440500002587,
+      "p99": 7.7321450600109545
+    },
+    "inter_result_interval_ms": {
+      "count": 4773,
+      "mean": 123.09422191493445,
+      "min": 1.7003999964799732,
+      "max": 232.46060000383295,
+      "p50": 125.69960000109859,
+      "p90": 137.69337999692652,
+      "p95": 141.75858000526205,
+      "p99": 149.08522399724455
+    },
+    "cadence_abs_dev_ms": {
+      "count": 4773,
+      "mean": 8.061429521666668,
+      "min": 0.0007378605266694649,
+      "max": 123.2882621350393,
+      "p50": 2.467862135537189,
+      "p90": 17.288597865107256,
+      "p95": 20.752717874555596,
+      "p99": 78.39261412927148
+    },
+    "total_server_time_ms": {
+      "count": 4773,
+      "mean": 48.94887911166981,
+      "min": 40.0,
+      "max": 2217.0,
+      "p50": 47.0,
+      "p90": 50.0,
+      "p95": 51.0,
+      "p99": 67.55999999999949
+    },
+    "audio_age_lag_ms": {
+      "count": 4794,
+      "mean": 3206.4841251358357,
+      "min": 3100.602299993625,
+      "max": 5349.938100000145,
+      "p50": 3177.2587499945075,
+      "p90": 3298.375500002294,
+      "p95": 3307.103240005381,
+      "p99": 3357.442011001839
+    },
+    "query_rtt_ms": {
+      "count": 0
+    },
+    "results_per_session": [
+      74,
+      74,
+      74,
+      74,
+      74,
+      74,
+      74,
+      74,
+      74,
+      74,
+      74,
+      74,
+      74,
+      74,
+      74,
+      74,
+      74,
+      74,
+      74,
+      74,
+      3314
+    ],
+    "errors": [],
+    "error_results": 0,
+    "buffering_results": 1173,
+    "resources": {
+      "rss_mib": {
+        "count": 674,
+        "mean": 1016.2176894009644,
+        "min": 680.53125,
+        "max": 1074.0703125,
+        "p50": 1042.6328125,
+        "p90": 1073.1640625,
+        "p95": 1073.721484375,
+        "p99": 1073.95703125
+      },
+      "cpu_pct": {
+        "count": 674,
+        "mean": 439.0344213649852,
+        "min": 0.0,
+        "max": 579.1,
+        "p50": 529.0,
+        "p90": 538.5,
+        "p95": 540.9,
+        "p99": 546.5079999999999
+      },
+      "gpu_used_mib": {
+        "count": 674,
+        "mean": 1321.632047477745,
+        "min": 1090.0,
+        "max": 2584.0,
+        "p50": 1316.0,
+        "p90": 1347.0,
+        "p95": 1354.0,
+        "p99": 1388.0
+      },
+      "gpu_util_pct": {
+        "count": 674,
+        "mean": 27.90652818991098,
+        "min": 1.0,
+        "max": 70.0,
+        "p50": 32.0,
+        "p90": 33.700000000000045,
+        "p95": 35.0,
+        "p99": 47.26999999999998
+      },
+      "nvidia_smi_available": true,
+      "remote_endpoints": [
+        "127.0.0.1:52677",
+        "127.0.0.1:52700",
+        "127.0.0.1:56545",
+        "127.0.0.1:56546",
+        "127.0.0.1:56547",
+        "127.0.0.1:56548",
+        "127.0.0.1:56766",
+        "127.0.0.1:56790",
+        "127.0.0.1:58558",
+        "127.0.0.1:60811",
+        "127.0.0.1:62240",
+        "127.0.0.1:62715",
+        "127.0.0.1:62746",
+        "127.0.0.1:63781"
+      ]
+    }
+  }
+}

@@ -27,6 +27,11 @@ class ResourceMonitor:
         self.cpu_pct = Series("cpu_pct")
         self.gpu_used_mib = Series("gpu_used_mib")
         self.gpu_util_pct = Series("gpu_util_pct")
+        # NFR-SEC-001: remote endpoints of the server process observed over
+        # the run, sampled every ~30 s via psutil (scoped to the process,
+        # so OS DNS/platform telemetry stays excluded by construction).
+        self.remote_endpoints = set()
+        self._conn_tick = 0
         self._stop = threading.Event()
         self._t0 = time.monotonic()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -57,6 +62,15 @@ class ResourceMonitor:
             if used is not None:
                 self.gpu_used_mib.add(t, used)
                 self.gpu_util_pct.add(t, util)
+            self._conn_tick += 1
+            if self.proc is not None and self._conn_tick % 30 == 0:
+                try:
+                    for c in self.proc.connections(kind="inet"):
+                        if c.raddr:
+                            self.remote_endpoints.add(
+                                f"{c.raddr.ip}:{c.raddr.port}")
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
             self._stop.wait(self.interval_s)
 
     def now(self):
@@ -78,7 +92,25 @@ class ResourceMonitor:
             "gpu_used_mib": self.gpu_used_mib.bundle(),
             "gpu_util_pct": self.gpu_util_pct.bundle(),
             "nvidia_smi_available": self.nvidia_ok,
+            "remote_endpoints": sorted(self.remote_endpoints),
         }
+
+    def non_lan_endpoint_count(self, lan_hosts=("127.0.0.1", "::1")):
+        """NFR-SEC-001: remote endpoints that are neither loopback, the
+        configured LAN server, nor RFC 1918 private space."""
+        import ipaddress
+        count = 0
+        for ep in self.remote_endpoints:
+            ip = ep.rsplit(":", 1)[0]
+            if ip in lan_hosts:
+                continue
+            try:
+                if ipaddress.ip_address(ip).is_private:
+                    continue
+            except ValueError:
+                pass
+            count += 1
+        return count
 
 
 def read_server_info(path):
