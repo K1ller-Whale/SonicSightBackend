@@ -128,6 +128,25 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
         cycles_processed = 0
         seq_number = 0
 
+        # ── Overlapped inference (defect D-P5-1, 2026-08-10) ──
+        # Inference used to be awaited inline in the ingest loop, so each
+        # cycle's wall cost was inference (~150 ms multisensory) PLUS the
+        # serialized drain of every message that queued during it. That
+        # pushed the cycle past the 250 ms hop about 2 of every 3 windows
+        # and the measured stride became ~372 ms (stride-dump evidence:
+        # window_delta mixing 2-chunk and 3-chunk advances). Inference now
+        # runs as a single in-flight task while ingest continues; a
+        # completed window is finalized (OLA + yield) on the next inbound
+        # message. At most ONE inference is in flight per stream, and the
+        # process-wide lock still serializes across streams, so ordering
+        # and GPU discipline are unchanged.
+        inf_task = None
+        inf_ctx = None
+
+        async def _locked_infer(aw, fr):
+            async with self._inference_lock:
+                return await asyncio.to_thread(engine.eval_stream_window, aw, fr)
+
         try:
             async for chunk in request_iterator:
                 chunk_receive_time = time.time()
@@ -170,67 +189,112 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                     except Exception as e:
                         logger.info(f"Error decoding frame: {e}")
 
-                # 2. Check if we have enough data to run inference
-                if not buffer.has_enough_data():
-                    # Stream back a "buffering" status
-                    if chunks_received % 10 == 0:  # Don't spam, send every 10th chunk
-                        yield sonicsight_pb2.StreamResult(
-                            success=True,
-                            is_buffering=True,
-                            timestamp_ms=chunk.timestamp_ms,
-                            model_id=model_id,
-                            heatmap_count=spec.heatmap_count,
-                        )
-                    continue
-
-                # 3. Get the latest valid window
-                window_start_time = time.time()
-                audio_window, frames, center_timestamp, window_start_sample = (
-                    buffer.get_latest_window()
-                )
-
-                if audio_window is None:
-                    # Still waiting for future audio to arrive to match the current frames
-                    if chunks_received % 10 == 0:
-                        yield sonicsight_pb2.StreamResult(
-                            success=True,
-                            is_buffering=True,
-                            timestamp_ms=chunk.timestamp_ms,
-                            model_id=model_id,
-                            heatmap_count=spec.heatmap_count,
-                        )
-                    continue
-
-                # Don't re-process the same window if no new frames have arrived
-                if center_timestamp == last_yielded_timestamp:
-                    continue
-
-                # 4. Run inference (synchronously in a thread to not block event loop)
-                logger.info(f"Running inference for timestamp {center_timestamp}ms... (Buffer prep took {int((window_start_time - chunk_receive_time)*1000)}ms)")
-
-                inference_start_time = time.time()
-                async with self._inference_lock:
-                    result = await asyncio.to_thread(
-                        engine.eval_stream_window,
+                # 2./3. Finalize a completed inference if one is ready;
+                # otherwise keep ingesting and (when idle) launch the next
+                # window. The current message finishes ingesting BEFORE any
+                # of this, so drain continues during inference.
+                if inf_task is not None:
+                    if not inf_task.done():
+                        if chunk.is_last:
+                            break
+                        continue
+                    result = inf_task.result()
+                    inf_task = None
+                    inference_end_time = time.time()
+                    (
                         audio_window,
-                        frames
+                        center_timestamp,
+                        window_start_sample,
+                        inference_start_time,
+                        chunk_receive_time,  # launch message's receive time:
+                        # total_server_time keeps meaning launch->yield
+                        window_mode,
+                        early_audio_len,
+                    ) = inf_ctx
+                    inf_ctx = None
+                    cycles_processed += 1
+                else:
+                    # No inference in flight: try to launch one.
+                    if not buffer.has_enough_data():
+                        # Stream back a "buffering" status
+                        if chunks_received % 10 == 0:  # Don't spam, send every 10th chunk
+                            yield sonicsight_pb2.StreamResult(
+                                success=True,
+                                is_buffering=True,
+                                timestamp_ms=chunk.timestamp_ms,
+                                model_id=model_id,
+                                heatmap_count=spec.heatmap_count,
+                            )
+                        if chunk.is_last:
+                            break
+                        continue
+
+                    window_start_time = time.time()
+                    audio_window, frames, center_timestamp, window_start_sample = (
+                        buffer.get_latest_window()
                     )
-                inference_end_time = time.time()
-                cycles_processed += 1
+
+                    if audio_window is None:
+                        # Still waiting for future audio to arrive to match the current frames
+                        if chunks_received % 10 == 0:
+                            yield sonicsight_pb2.StreamResult(
+                                success=True,
+                                is_buffering=True,
+                                timestamp_ms=chunk.timestamp_ms,
+                                model_id=model_id,
+                                heatmap_count=spec.heatmap_count,
+                            )
+                        if chunk.is_last:
+                            break
+                        continue
+
+                    # Don't re-process the same window if no new frames have arrived
+                    if center_timestamp == last_yielded_timestamp:
+                        if chunk.is_last:
+                            break
+                        continue
+
+                    # Stale-vs-OLA guard, moved from post-inference to launch
+                    # time: never spend a forward pass on a window OLA would
+                    # reject anyway. OLA only advances in this stream's own
+                    # finalize step, so the check is equivalent here.
+                    if (
+                        left_ola.latest_window_start is not None
+                        and window_start_sample <= left_ola.latest_window_start
+                    ):
+                        logger.warning(
+                            "Skipping stale streaming window before OLA: start_sample=%s last_start=%s center=%sms",
+                            window_start_sample,
+                            left_ola.latest_window_start,
+                            center_timestamp,
+                        )
+                        if chunk.is_last:
+                            break
+                        continue
+
+                    logger.info(f"Running inference for timestamp {center_timestamp}ms... (Buffer prep took {int((window_start_time - chunk_receive_time)*1000)}ms)")
+
+                    inference_start_time = time.time()
+                    # Buffer window-mode fields are captured NOW: the buffer
+                    # keeps advancing while the task runs, so reading them at
+                    # finalize time would race.
+                    inf_ctx = (
+                        audio_window,
+                        center_timestamp,
+                        window_start_sample,
+                        inference_start_time,
+                        chunk_receive_time,
+                        getattr(buffer, "_last_window_mode", "normal"),
+                        getattr(buffer, "_last_early_audio_len", 0),
+                    )
+                    inf_task = asyncio.create_task(
+                        _locked_infer(audio_window, frames))
+                    if chunk.is_last:
+                        break
+                    continue
 
                 # 5. Stitch full windows together with overlap-add.
                 post_start_time = time.time()
-                if (
-                    left_ola.latest_window_start is not None
-                    and window_start_sample <= left_ola.latest_window_start
-                ):
-                    logger.warning(
-                        "Skipping stale streaming window before OLA: start_sample=%s last_start=%s center=%sms",
-                        window_start_sample,
-                        left_ola.latest_window_start,
-                        center_timestamp,
-                    )
-                    continue
 
                 # Determine center-slice extraction offset.
                 # In early inference mode the real audio sits at the START of the
@@ -238,8 +302,8 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                 # buffer to extract from a position that falls inside the real audio,
                 # rather than the mathematical center of the window.
                 ola_center_offset = None
-                if getattr(buffer, '_last_window_mode', 'normal') == 'early':
-                    early_len = getattr(buffer, '_last_early_audio_len', 0)
+                if window_mode == 'early':
+                    early_len = early_audio_len
                     hop = left_ola.hop_samples
                     if early_len > hop:
                         # Place extraction in the center of the real audio portion
@@ -254,7 +318,7 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                 # samples / 53 KB. The phone JitterBuffer holds only 33 KB, so the write
                 # wraps 1.6x around the ring and corrupts every byte already in it,
                 # producing static for the rest of the session.
-                is_early_mode = getattr(buffer, '_last_window_mode', 'normal') == 'early'
+                is_early_mode = window_mode == 'early'
                 if is_early_mode:
                     # Skip audio output entirely; keep sending buffering status so the
                     # client stays alive. The heatmap is also low-quality here, so skip.
@@ -320,7 +384,7 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                                 if prev_window_start is not None
                                 else 0
                             ),
-                            "mode": getattr(buffer, "_last_window_mode", "normal"),
+                            "mode": window_mode,
                             "emitted_samples": len(left_pcm) // 2,
                             "audio_gain": d.get("audio_gain", 0.0),
                             "in_rms": d.get("in_rms", 0.0),
@@ -406,6 +470,21 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                 if chunk.is_last:
                     break
 
+            if inf_task is not None:
+                # Stream ended with a window still in flight. Await it so the
+                # inference lock is released in order, then discard: the OLA
+                # flush below already drains every sample the client is owed,
+                # and finalizing here would duplicate ~150 lines for at most
+                # one hop of audio at stream end.
+                try:
+                    await inf_task
+                except Exception:
+                    logger.debug("In-flight window at stream end failed; "
+                                 "discarded with the stream.", exc_info=True)
+                inf_task = None
+                logger.info("Discarded one in-flight window at stream end "
+                            "(flush covers the audio tail).")
+
             final_left_pcm = left_ola.flush()
             final_right_pcm = right_ola.flush()
             if dumper is not None:
@@ -449,6 +528,14 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                 model_id=model_id,
             )
         finally:
+            if inf_task is not None:
+                # Teardown with a window in flight (client cancel / error):
+                # detach quietly. The thread finishes and releases the
+                # inference lock on its own; swallow the result so asyncio
+                # never logs "exception was never retrieved".
+                inf_task.add_done_callback(
+                    lambda t: t.exception() if not t.cancelled() else None)
+                inf_task = None
             if dumper is not None:
                 summary = dumper.close(
                     {
