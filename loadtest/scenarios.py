@@ -103,28 +103,36 @@ def _session_meets_cadence(doc, stats):
 
 
 def _session_meets_cadence_and_cycle(doc, stats):
-    """Per-session cadence + server-time check against the model's own
-    target pair (PERF-003/004 for the SoP family, PERF-002/005 for
-    multisensory). Thresholds AND the set of statistics come from the
-    YAML, so a reconciliation that changes a target's statistics
-    (e.g. max -> p99) needs no code change here."""
-    srv = stats.server_times_ms()
-    if not srv:
-        return False
+    """Per-session cadence + cycle-cost check against the model's own
+    target pair (PERF-003/004 for the SoP family, PERF-015/005 for
+    multisensory). Thresholds, statistics AND the bounded metric come
+    from the YAML — an assertion on inference_time_ms is evaluated
+    against the per-result inference series, total_server_time_ms
+    against the launch-to-yield series — so the PERF-004/005 re-target
+    after the overlap change needs no further code change here."""
+    series = {
+        "total_server_time_ms": stats.server_times_ms(),
+        "inference_time_ms": stats.inference_times_ms(),
+    }
     if not _session_meets_cadence(doc, stats):
         return False
     cycle_tid = _session_target_ids(stats)[1]
+    checked = 0
     for a in doc["targets"][cycle_tid]["assertions"]:
+        vals = series.get(a["metric"])
+        if not vals:
+            return False  # bounded metric absent from the run: not a pass
         stat = a["statistic"]
         if stat == "max":
-            got = max(srv)
+            got = max(vals)
         elif stat.startswith("p") and stat[1:].isdigit():
-            got = metrics.percentile(srv, int(stat[1:]))
+            got = metrics.percentile(vals, int(stat[1:]))
         else:
             continue
+        checked += 1
         if not nfr._OPS[a["op"]](got, a["value"]):
             return False
-    return True
+    return checked > 0
 
 
 GAP_WINDOW_S = 300.0  # NFR-PERF-013's "consecutive non-overlapping 5-min
@@ -194,6 +202,14 @@ def _aggregate_single(stats_list, doc):
         measured["total_server_time_ms"] = {
             "p95": metrics.percentile(srv, 95),
             "p99": metrics.percentile(srv, 99), "max": max(srv)}
+    inf = [v for st in stats_list for v in st.inference_times_ms()]
+    if inf:
+        # After the 2026-08-10 overlap change, total_server_time_ms spans
+        # the deliberate ingest/inference overlap (pipeline occupancy);
+        # inference_time_ms is the compute figure PERF-004/005 bound.
+        measured["inference_time_ms"] = {
+            "p95": metrics.percentile(inf, 95),
+            "p99": metrics.percentile(inf, 99), "max": max(inf)}
     gap = _gap_rate_windows(stats_list)
     if gap is not None:
         measured["sequence_gap_rate"] = {"proportion": gap}

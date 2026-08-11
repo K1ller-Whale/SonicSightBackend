@@ -1,0 +1,2 @@
+run 20260811T054723Z-baseline: 0 failing assertion(s), 1 not-measured; results: loadtest/results/em4-baseline/results.json
+  WARNING not-measured: NFR-FUNC-001 replay_left_right_pearson/max_over_runs — a masked defect, not a pass

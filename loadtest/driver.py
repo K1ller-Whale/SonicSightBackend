@@ -158,6 +158,9 @@ class SessionStats:
     def server_times_ms(self):
         return [r["total_server_ms"] for r in self.results if r["total_server_ms"]]
 
+    def inference_times_ms(self):
+        return [r["inference_ms"] for r in self.results if r["inference_ms"]]
+
     def audio_ages_ms(self):
         return [r["audio_age_ms"] for r in self.results if r["audio_age_ms"] is not None]
 

@@ -144,8 +144,15 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
         inf_ctx = None
 
         async def _locked_infer(aw, fr):
+            # Times the forward pass itself (thread dispatch included, lock
+            # wait and finalize latency excluded), so inference_time_ms keeps
+            # meaning COMPUTE after the overlap change; total_server_time_ms
+            # (launch-message receive -> yield) now spans the deliberate
+            # overlap and is a pipeline-occupancy figure, not a compute one.
             async with self._inference_lock:
-                return await asyncio.to_thread(engine.eval_stream_window, aw, fr)
+                t0 = time.time()
+                r = await asyncio.to_thread(engine.eval_stream_window, aw, fr)
+                return r, t0, time.time()
 
         try:
             async for chunk in request_iterator:
@@ -198,14 +205,14 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                         if chunk.is_last:
                             break
                         continue
-                    result = inf_task.result()
+                    result, inference_start_time, inference_end_time = (
+                        inf_task.result())
                     inf_task = None
-                    inference_end_time = time.time()
                     (
                         audio_window,
                         center_timestamp,
                         window_start_sample,
-                        inference_start_time,
+                        _launch_time,
                         chunk_receive_time,  # launch message's receive time:
                         # total_server_time keeps meaning launch->yield
                         window_mode,

@@ -1,0 +1,323 @@
+{
+  "run_id": "20260810T131233Z-smoke",
+  "meta": {
+    "timestamp_utc": "2026-08-10T13:13:21Z",
+    "scenario": "smoke",
+    "params": {
+      "scenario": "smoke",
+      "host": "127.0.0.1",
+      "port": 50051,
+      "model": "sonicsight",
+      "environment": "E-M",
+      "duration": 420.0,
+      "runs": 20,
+      "ttfr_probe_seconds": 15.0,
+      "sessions": 2,
+      "stagger": 1.0,
+      "max_sessions": 6,
+      "step_duration": 420.0,
+      "burst_sessions": 4,
+      "cycles": 100,
+      "cycle_duration": 10.0,
+      "models": "sonicsight,sonicsight-pixel",
+      "injections": "",
+      "injection_duration": 330.0,
+      "disconnect_cycles": 50,
+      "disconnect_after": 10.0,
+      "settle_seconds": 30.0,
+      "video": null,
+      "replay_runs": 3,
+      "server_info": "loadtest/results/current-wsl2/server.json",
+      "server_log": null,
+      "open_marker": "Client connected for StreamProcess",
+      "close_marker": null,
+      "offline": false,
+      "out": "loadtest/results/em2-smoke"
+    },
+    "git": {
+      "SonicSightBackend": {
+        "head": "f840ce16afdd804bafa5cf8af1f934048e5728cf",
+        "branch": "em-verification",
+        "dirty": true
+      },
+      "SonicSightMobile": {
+        "head": "09af71a599ea0922733e20b24b0ec030fcd9c37b",
+        "branch": "em-verification",
+        "dirty": false
+      }
+    },
+    "checkpoints": {
+      ".txt": {
+        "bytes": 0,
+        "sha256_16": "e3b0c44298fc1c14"
+      },
+      "frame_best.pth": {
+        "bytes": 45356134,
+        "sha256_16": "33b22fb447eaa10e"
+      },
+      "sound_best.pth": {
+        "bytes": 121145339,
+        "sha256_16": "c1d45b3a9cb469db"
+      },
+      "synthesizer_best.pth": {
+        "bytes": 652,
+        "sha256_16": "fa29d150d72a8c7b"
+      }
+    },
+    "host": {
+      "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+      "machine": "x86_64",
+      "node": "LAPTOP-ECSUL8L2",
+      "python": "3.12.13"
+    },
+    "gpu": "NVIDIA GeForce GTX 1660 Ti, 610.88, 6144 MiB",
+    "nfr_targets_yaml": {
+      "bytes": 36367,
+      "sha256_16": "c1b14b0c73772c80"
+    },
+    "torch": {
+      "version": "2.11.0+cu128",
+      "cuda": "12.8"
+    },
+    "grpcio": "1.83.0"
+  },
+  "wall_seconds": 47.20847129821777,
+  "measured": {
+    "differing_bytes_between_proto_copies": {
+      "count": 0
+    },
+    "unit_test_failures": {
+      "count": 0
+    },
+    "unit_test_collection_errors": {
+      "count": 0
+    },
+    "report_yaml_threshold_mismatches": {
+      "count": 0
+    },
+    "pytorch_modes_served_without_tf": {
+      "count": 2
+    },
+    "models_served_on_e_d_without_tf": {
+      "count": 2
+    },
+    "models_served_on_e_m_class_with_tf": {
+      "count": 3
+    },
+    "health_lists_exactly_loaded_models": {
+      "boolean": true
+    },
+    "metadata_less_streams_running_sonicsight": {
+      "proportion": 1.0
+    }
+  },
+  "assertions": [
+    {
+      "id": "NFR-COMPAT-001",
+      "metric": "differing_bytes_between_proto_copies",
+      "statistic": "count",
+      "op": "==",
+      "target": 0,
+      "unit": "bytes",
+      "measured": 0,
+      "outcome": "pass"
+    },
+    {
+      "id": "NFR-COMPAT-002",
+      "metric": "metadata_less_streams_running_sonicsight",
+      "statistic": "proportion",
+      "op": ">=",
+      "target": 1.0,
+      "unit": "ratio",
+      "measured": 1.0,
+      "outcome": "pass"
+    },
+    {
+      "id": "NFR-COMPAT-003",
+      "metric": "pytorch_modes_served_without_tf",
+      "statistic": "count",
+      "op": ">=",
+      "target": 2,
+      "unit": "models",
+      "measured": 2,
+      "outcome": "pass"
+    },
+    {
+      "id": "NFR-COMPAT-003",
+      "metric": "health_lists_exactly_loaded_models",
+      "statistic": "boolean",
+      "op": "==",
+      "target": true,
+      "unit": "bool",
+      "measured": true,
+      "outcome": "pass"
+    },
+    {
+      "id": "NFR-MAINT-001",
+      "metric": "unit_test_failures",
+      "statistic": "count",
+      "op": "==",
+      "target": 0,
+      "unit": "count",
+      "measured": 0,
+      "outcome": "pass"
+    },
+    {
+      "id": "NFR-MAINT-001",
+      "metric": "unit_test_collection_errors",
+      "statistic": "count",
+      "op": "==",
+      "target": 0,
+      "unit": "count",
+      "measured": 0,
+      "outcome": "pass"
+    },
+    {
+      "id": "NFR-MAINT-004",
+      "metric": "hardcoded_threshold_literals_in_loadtest",
+      "statistic": "count",
+      "outcome": "inspection",
+      "reason": "discharged by inspection per the YAML (no fabricated measured count)"
+    },
+    {
+      "id": "NFR-MAINT-004",
+      "metric": "report_yaml_threshold_mismatches",
+      "statistic": "count",
+      "op": "==",
+      "target": 0,
+      "unit": "mismatches",
+      "measured": 0,
+      "outcome": "pass"
+    },
+    {
+      "id": "NFR-FLEX-001",
+      "metric": "models_served_on_e_d_without_tf",
+      "statistic": "count",
+      "op": ">=",
+      "target": 2,
+      "unit": "models",
+      "measured": 2,
+      "outcome": "pass"
+    },
+    {
+      "id": "NFR-FLEX-001",
+      "metric": "models_served_on_e_m_class_with_tf",
+      "statistic": "count",
+      "op": "==",
+      "target": 3,
+      "unit": "models",
+      "measured": 3,
+      "outcome": "pass"
+    },
+    {
+      "id": "NFR-FUNC-003",
+      "outcome": "not-evaluable-by-this-suite",
+      "reason": "scenario(s) ['unit'] are outside the load suite (unit/inspection/analysis/mobile)"
+    },
+    {
+      "id": "NFR-INT-001",
+      "outcome": "not-evaluable-by-this-suite",
+      "reason": "scenario(s) ['mobile-instrumented'] are outside the load suite (unit/inspection/analysis/mobile)"
+    },
+    {
+      "id": "NFR-INT-002",
+      "outcome": "not-evaluable-by-this-suite",
+      "reason": "scenario(s) ['unit'] are outside the load suite (unit/inspection/analysis/mobile)"
+    },
+    {
+      "id": "NFR-INT-003",
+      "outcome": "not-evaluable-by-this-suite",
+      "reason": "scenario(s) ['mobile-accessibility'] are outside the load suite (unit/inspection/analysis/mobile)"
+    },
+    {
+      "id": "NFR-INT-004",
+      "outcome": "not-evaluable-by-this-suite",
+      "reason": "scenario(s) ['unit'] are outside the load suite (unit/inspection/analysis/mobile)"
+    },
+    {
+      "id": "NFR-SEC-002",
+      "outcome": "not-evaluable-by-this-suite",
+      "reason": "scenario(s) ['inspection'] are outside the load suite (unit/inspection/analysis/mobile)"
+    },
+    {
+      "id": "NFR-MAINT-002",
+      "outcome": "not-evaluable-by-this-suite",
+      "reason": "scenario(s) ['analysis'] are outside the load suite (unit/inspection/analysis/mobile)"
+    },
+    {
+      "id": "NFR-MAINT-003",
+      "outcome": "not-evaluable-by-this-suite",
+      "reason": "scenario(s) ['unit'] are outside the load suite (unit/inspection/analysis/mobile)"
+    },
+    {
+      "id": "NFR-FLEX-002",
+      "outcome": "not-evaluable-by-this-suite",
+      "reason": "scenario(s) ['mobile-matrix'] are outside the load suite (unit/inspection/analysis/mobile)"
+    },
+    {
+      "id": "NFR-FLEX-003",
+      "outcome": "not-evaluable-by-this-suite",
+      "reason": "scenario(s) ['mobile-matrix'] are outside the load suite (unit/inspection/analysis/mobile)"
+    }
+  ],
+  "extras": {
+    "pytest_tail": [
+      "",
+      "-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html",
+      "79 passed, 1 skipped, 5 warnings in 44.99s"
+    ],
+    "health": {
+      "model_loaded": true,
+      "device": "cuda",
+      "loaded_models": [
+        "sonicsight",
+        "multisensory",
+        "sonicsight-pixel"
+      ]
+    },
+    "resources": {
+      "rss_mib": {
+        "count": 27,
+        "mean": 3066.4327256944443,
+        "min": 2983.14453125,
+        "max": 3076.84375,
+        "p50": 3076.84375,
+        "p90": 3076.84375,
+        "p95": 3076.84375,
+        "p99": 3076.84375
+      },
+      "cpu_pct": {
+        "count": 27,
+        "mean": 0.4740740740740741,
+        "min": 0.0,
+        "max": 1.7,
+        "p50": 0.5,
+        "p90": 0.9,
+        "p95": 0.97,
+        "p99": 1.517999999999999
+      },
+      "gpu_used_mib": {
+        "count": 27,
+        "mean": 1893.4444444444443,
+        "min": 1360.0,
+        "max": 3270.0,
+        "p50": 1376.0,
+        "p90": 2573.0,
+        "p95": 2735.6,
+        "p99": 3148.8399999999992
+      },
+      "gpu_util_pct": {
+        "count": 27,
+        "mean": 9.555555555555555,
+        "min": 1.0,
+        "max": 52.0,
+        "p50": 7.0,
+        "p90": 15.400000000000023,
+        "p95": 23.4,
+        "p99": 44.719999999999956
+      },
+      "nvidia_smi_available": true,
+      "remote_endpoints": []
+    }
+  }
+}
