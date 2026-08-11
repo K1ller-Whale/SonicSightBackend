@@ -1,0 +1,40 @@
+
+=== STREAM SUMMARY ===
+  wall time        : 71.1 s
+  audio chunks sent: 569
+  frame chunks sent: 569
+  results received : 520  (buffering 9, errors 0)
+  samples returned : 718035  (65.13 s)
+  input streamed   : 784082  (71.12 s)
+  output/input     : 0.916  (1.0 = every input sample came back)
+  heatmap max      : mean 0.9914  (1.000 everywhere = saturated)
+  heatmap min      : mean 0.0078
+
+=== SEPARATION METRICS (compare to your /predict run) ===
+  reference /predict on this clip:
+      pearson +0.263 | flatness L 0.114 R 0.205 | rms ratio 0.936
+
+  duration        : 65.13 s
+  rms L / R       : 0.051898 / 0.054672   ratio 0.949
+  flatness L / R  : 0.0928 / 0.1506   (1.0 = white noise, <0.25 = tonal)
+  pearson(L,R)    : +0.187203            (lower = better separation)
+  spec corr       : +0.160142
+  implied maskL   : mean 0.4721 std 0.2616
+  frac bins 0.4-0.6: 0.3128   (high = 50/50 split = NOT separating)
+
+  band split (% of each band's energy going L / R):
+        0-  150 Hz   L  95.49   R   4.51
+      150-  300 Hz   L  51.72   R  48.28
+      300-  600 Hz   L  39.62   R  60.38
+      600- 1200 Hz   L  56.47   R  43.53
+     1200- 2400 Hz   L  20.06   R  79.94
+     2400- 5512 Hz   L  23.19   R  76.81
+
+=== INPUT SANITY (should look like clean music, NOT like the mic) ===
+  streamed mixture: flatness 0.1414 | 150-600 Hz 77.2% | 2400+ Hz 1.0%
+  clean reference : flatness 0.183 | 150-600 Hz 81.0% | 2400+ Hz  1.0%
+  phone mic (bad) : flatness 0.588 | 150-600 Hz 11.0% | 2400+ Hz 43.3%
+
+=== VERDICT ===
+  Separation matches the offline ceiling. The streaming CODE IS FINE.
+  The live-app problem is entirely the speaker->room->mic capture.

@@ -75,34 +75,64 @@ def _server_log_since(path, t0):
     return "".join(kept)
 
 
+# Per-model target pairing for the per-session load/stress check. The
+# multisensory model's cadence and server-time budgets live in their own
+# targets (250 ms hop, 200 ms window) — checking it against the SoP-tuned
+# PERF-003/004 would assert the wrong requirement. The pairing is the only
+# model-dispatch here; every value still comes from the YAML.
+_SESSION_TARGETS = {
+    "multisensory": ("NFR-PERF-015", "NFR-PERF-005",
+                     "sessions_meeting_perf_015_and_005"),
+}
+_SESSION_TARGETS_DEFAULT = ("NFR-PERF-003", "NFR-PERF-004",
+                            "sessions_meeting_perf_003_and_004")
+
+
+def _session_target_ids(stats):
+    return _SESSION_TARGETS.get(stats.profile["model_id"],
+                                _SESSION_TARGETS_DEFAULT)
+
+
 def _session_meets_cadence(doc, stats):
     dev_p95 = metrics.percentile(stats.cadence_abs_dev_ms(), 95)
     if dev_p95 is None:
         return False
+    cadence_tid = _session_target_ids(stats)[0]
     return dev_p95 <= _assertion_value(
-        doc, "NFR-PERF-003", "inter_result_interval_abs_dev_from_125ms", "p95")
+        doc, cadence_tid, "inter_result_interval_abs_dev_from_125ms", "p95")
 
 
 def _session_meets_cadence_and_cycle(doc, stats):
-    """Per-session NFR-PERF-003 + NFR-PERF-004 check. Thresholds AND the
-    set of statistics come from the YAML, so a reconciliation that changes
-    PERF-004's statistics (e.g. max -> p99) needs no code change here."""
-    srv = stats.server_times_ms()
-    if not srv:
-        return False
+    """Per-session cadence + cycle-cost check against the model's own
+    target pair (PERF-003/004 for the SoP family, PERF-015/005 for
+    multisensory). Thresholds, statistics AND the bounded metric come
+    from the YAML — an assertion on inference_time_ms is evaluated
+    against the per-result inference series, total_server_time_ms
+    against the launch-to-yield series — so the PERF-004/005 re-target
+    after the overlap change needs no further code change here."""
+    series = {
+        "total_server_time_ms": stats.server_times_ms(),
+        "inference_time_ms": stats.inference_times_ms(),
+    }
     if not _session_meets_cadence(doc, stats):
         return False
-    for a in doc["targets"]["NFR-PERF-004"]["assertions"]:
+    cycle_tid = _session_target_ids(stats)[1]
+    checked = 0
+    for a in doc["targets"][cycle_tid]["assertions"]:
+        vals = series.get(a["metric"])
+        if not vals:
+            return False  # bounded metric absent from the run: not a pass
         stat = a["statistic"]
         if stat == "max":
-            got = max(srv)
+            got = max(vals)
         elif stat.startswith("p") and stat[1:].isdigit():
-            got = metrics.percentile(srv, int(stat[1:]))
+            got = metrics.percentile(vals, int(stat[1:]))
         else:
             continue
+        checked += 1
         if not nfr._OPS[a["op"]](got, a["value"]):
             return False
-    return True
+    return checked > 0
 
 
 GAP_WINDOW_S = 300.0  # NFR-PERF-013's "consecutive non-overlapping 5-min
@@ -172,6 +202,14 @@ def _aggregate_single(stats_list, doc):
         measured["total_server_time_ms"] = {
             "p95": metrics.percentile(srv, 95),
             "p99": metrics.percentile(srv, 99), "max": max(srv)}
+    inf = [v for st in stats_list for v in st.inference_times_ms()]
+    if inf:
+        # After the 2026-08-10 overlap change, total_server_time_ms spans
+        # the deliberate ingest/inference overlap (pipeline occupancy);
+        # inference_time_ms is the compute figure PERF-004/005 bound.
+        measured["inference_time_ms"] = {
+            "p95": metrics.percentile(inf, 95),
+            "p99": metrics.percentile(inf, 99), "max": max(inf)}
     gap = _gap_rate_windows(stats_list)
     if gap is not None:
         measured["sequence_gap_rate"] = {"proportion": gap}
@@ -260,6 +298,14 @@ def baseline(args, doc, ctx):
     if steady.query_rtts_ms:
         measured["query_round_trip"] = {
             "p95": metrics.percentile(steady.query_rtts_ms, 95)}
+    # NFR-FUNC-002: structural contract over every non-buffering
+    # multisensory result of the run (TTFR probes + steady session).
+    if model == "multisensory":
+        checked = sum(st.contract_checked for st in ttfr_stats + [steady])
+        bad = sum(st.contract_violations for st in ttfr_stats + [steady])
+        if checked:
+            measured["results_meeting_multisensory_contract"] = {
+                "proportion": (checked - bad) / float(checked)}
     measured.update(_loop_lag_measured(ctx))
 
     extras = _characterise(ttfr_stats + [steady])
@@ -315,13 +361,21 @@ def load(args, doc, ctx):
 
     measured = _aggregate_single(stats, doc)
     ok = sum(1 for st in stats if _session_meets_cadence_and_cycle(doc, st))
-    measured["sessions_meeting_perf_003_and_004"] = {"count": ok}
+    floor_metric = _session_target_ids(stats[0])[2]
+    measured[floor_metric] = {"count": ok}
     if mon is not None:
         # steady state: after the first 5 min of the session (yaml
         # steady_state prose), on the monitor axis from session start.
         steady = mon.gpu_used_mib.window((t_start or 0) + 300.0, float("inf"))
         if steady:
             measured["gpu_memory_used"] = {"max_over_steady_state": max(steady)}
+        # NFR-SEC-001 (scenario list includes load): endpoints the server
+        # process contacted over the held-load window. Previously only
+        # soak emitted this, so every load run printed a spurious
+        # "not-measured" for SEC-001 (observed in p5-load).
+        measured["non_lan_endpoints_contacted"] = {
+            "count": mon.non_lan_endpoint_count(
+                lan_hosts=("127.0.0.1", "::1", args.host))}
     measured.update(_loop_lag_measured(ctx))
     return measured, _characterise(stats)
 
@@ -335,6 +389,8 @@ def stress(args, doc, ctx):
     ceiling = None
     steps = {}
     floor_count = 0
+    floor_metric = _SESSION_TARGETS.get(
+        args.model, _SESSION_TARGETS_DEFAULT)[2]
     for n in range(1, args.max_sessions + 1):
         stats = asyncio.run(driver.run_many(
             args.host, args.port, args.model, make, n,
@@ -351,7 +407,7 @@ def stress(args, doc, ctx):
         "concurrency_ceiling": {
             "first_breaching_concurrency": ceiling,
             "note": "None = no breach up to --max-sessions"},
-        "sessions_meeting_perf_003_and_004": {"count": floor_count},
+        floor_metric: {"count": floor_count},
     }
     measured.update(_loop_lag_measured(ctx))
     return measured, {"steps": steps}
@@ -793,6 +849,10 @@ def smoke(args, doc, ctx):
             "count": len(pytorch_served)}
         measured["models_served_on_e_d_without_tf"] = {
             "count": len(pytorch_served)}
+        # NFR-FLEX-001's E-M half: on a TensorFlow-capable host the full
+        # registry must serve. Emitted unconditionally; the assertion is
+        # e-m-conditional in the YAML so E-D runs still report it skipped.
+        measured["models_served_on_e_m_class_with_tf"] = {"count": len(served)}
         # "exactly": the served set must be one of the two legitimate
         # states of the registry — all models, or all minus multisensory —
         # and the any-loaded flag must agree.

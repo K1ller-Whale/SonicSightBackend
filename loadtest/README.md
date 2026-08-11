@@ -1,5 +1,17 @@
 # SonicSight backend load and stress suite
 
+> **2026-08-10 — E-M coverage and provenance.** `docs/nfr/nfr_targets.yaml`
+> was reconstructed (the original was never committed; see the provenance
+> header in the YAML and `docs/nfr/P5_VALIDATION.md` for the audit of the
+> p5-* runs, including the targets-file drift across them). The suite now
+> checks multisensory sessions against their own targets (PERF-002/005 —
+> 250 ms hop, not the SoP 125 ms pair), emits
+> `sessions_meeting_perf_002_and_005` for PERF-010, verifies the
+> multisensory result contract (FUNC-002) in `--model multisensory`
+> baselines, reports `models_served_on_e_m` (FLEX-001's E-M half), and
+> emits SEC-001's endpoint count from `load` as well as `soak`.
+> `run_campaign.sh` reproduces the full E-M campaign on one fresh server.
+
 Produces the numbers Section 10 of `docs/ANALYSIS_REPORT.md` cites. Every
 assertion threshold is read at run time from `docs/nfr/nfr_targets.yaml`
 (the single source of truth, NFR-MAINT-004) — no threshold literal exists in

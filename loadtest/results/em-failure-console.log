@@ -1,0 +1,2 @@
+run 20260810T091610Z-failure-injection: 0 failing assertion(s), 1 not-measured; results: loadtest/results/em-failure/results.json
+  WARNING not-measured: NFR-REL-002 stream_open_minus_close_log_lines/count — a masked defect, not a pass

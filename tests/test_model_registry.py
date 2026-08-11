@@ -83,9 +83,21 @@ def test_buffer_defaults_match_pre_registry_behaviour():
 def test_window_min_advance_defaults_preserve_sop_semantics():
     # SoP: min_advance 1 == the old strict "start > last" rule, unchanged.
     assert REGISTRY["sonicsight"].window_min_advance == 1
-    # Multisensory: paced by its hop, or 30 fps frames offer a newer window
-    # after every frame and inference runs back-to-back at ~150 ms.
-    assert REGISTRY["multisensory"].window_min_advance == REGISTRY["multisensory"].hop_samples == 5512
+    # Multisensory: paced by its hop — but window candidates carry up to
+    # ~990 samples of slack below the 2756-sample audio-chunk grid (frame
+    # timestamps quantise to 735 samples at 30 fps; starts snap down to
+    # the 256-sample STFT grid), so the guard must sit BELOW
+    # hop - slack or the 2-chunk (250 ms) candidate is rejected and the
+    # served stride degrades to 3 chunks = 371.5 ms (defect D-P5-1,
+    # measured). It must also stay ABOVE one chunk (2756) or inference
+    # runs back-to-back at every frame. Invariant: one chunk < guard <=
+    # hop - worst-case slack.
+    ms = REGISTRY["multisensory"]
+    assert ms.hop_samples == 5512
+    chunk = 2756           # 125 ms of audio at the 22050 Hz wire rate
+    worst_slack = 735 + 256  # frame-grid + STFT-snap shave on a candidate
+    assert chunk < ms.window_min_advance <= ms.hop_samples - worst_slack
+    assert ms.window_min_advance == 4480
     assert StreamingBuffer().window_min_advance == 1
 
 

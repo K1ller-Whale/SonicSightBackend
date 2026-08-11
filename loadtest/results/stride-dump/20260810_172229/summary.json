@@ -1,0 +1,22 @@
+{
+  "duration_s": 89.98,
+  "mic_chunks": 720,
+  "mic_samples": 1984320,
+  "mic_seconds": 179.98,
+  "mic_peak": 16377,
+  "mic_rms": 7851.637116036314,
+  "emitted_samples_left": 1936902,
+  "emitted_seconds_left": 175.68,
+  "emitted_peak_left": 19025,
+  "control_samples": 1936902,
+  "cycles": 264,
+  "windows_dumped": 6,
+  "final_chunk_drift_ms": -90108.7,
+  "chunks_received": 3418,
+  "cycles_processed": 264,
+  "session_seconds": 89.92,
+  "ola_gap_fills": 0,
+  "ola_splice_fallbacks": 0,
+  "ola_lagging_windows": 0,
+  "ola_total_emitted": 1936902
+}

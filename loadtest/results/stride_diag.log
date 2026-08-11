@@ -1,0 +1,15 @@
+14:22:14 starting stride diagnostic
+14:22:29 server ready
+results: 265 interval median: 371.8
+14:24:02 dump dir: loadtest/results/stride-dump/20260810_172229/
+      1 0
+      1 5376
+     63 5768
+     13 5888
+     11 6024
+     12 7936
+     86 8012
+      1 8102
+     12 8192
+     64 8268
+14:24:02 STRIDE-DIAG-COMPLETE

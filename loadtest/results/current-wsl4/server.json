@@ -1,0 +1,6 @@
+{
+  "pid": 218608,
+  "port": 50051,
+  "started_utc": "2026-08-10T14:15:52Z",
+  "loop_lag_csv": "loadtest/results/current-wsl4/loop_lag.csv"
+}

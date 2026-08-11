@@ -1,0 +1,2 @@
+run 20260811T055927Z-baseline: 0 failing assertion(s), 1 not-measured; results: loadtest/results/em4-baseline-ms/results.json
+  WARNING not-measured: NFR-FUNC-002 cross_check_margin/value — a masked defect, not a pass
