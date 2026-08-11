@@ -1,0 +1,11 @@
+05:46:58 BOOT starting
+05:47:22 BOOT ready
+05:47:22 START em4-baseline
+05:59:26 DONE em4-baseline exit=2
+05:59:26 START em4-baseline-ms
+06:11:30 DONE em4-baseline-ms exit=2
+06:11:30 START em4-load-ms
+06:23:34 DONE em4-load-ms exit=0
+06:23:34 START em4-smoke
+06:23:54 DONE em4-smoke exit=0
+06:23:54 CAMPAIGN4-COMPLETE

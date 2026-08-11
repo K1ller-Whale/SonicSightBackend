@@ -1,0 +1,15 @@
+16:42:02 BOOT starting
+16:42:14 BOOT ready
+16:42:14 START em3-baseline-ms
+16:54:16 DONE em3-baseline-ms exit=1
+16:54:16 START em3-load-ms
+17:06:19 DONE em3-load-ms exit=1
+17:06:19 START em3-baseline
+17:18:20 DONE em3-baseline exit=2
+17:18:20 START em3-baseline-replay
+17:23:23 DONE em3-baseline-replay exit=2
+17:23:23 START em3-soak-clean
+17:53:25 DONE em3-soak-clean exit=1
+17:53:25 START em3-smoke
+17:53:39 DONE em3-smoke exit=0
+17:53:39 CAMPAIGN3-COMPLETE

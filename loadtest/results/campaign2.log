@@ -1,0 +1,16 @@
+11:59:29 BOOT-A starting
+11:59:50 BOOT-A ready (pid 182720)
+11:59:50 START em2-baseline-ms
+12:11:51 DONE em2-baseline-ms exit=1
+12:11:51 START em2-load-ms
+12:23:54 DONE em2-load-ms exit=1
+12:23:54 START em2-failure
+13:12:33 DONE em2-failure exit=2
+13:12:33 START em2-smoke
+13:13:22 DONE em2-smoke exit=0
+13:13:27 BOOT-A stopped
+13:13:27 BOOT-B starting (SONICSIGHT_DUMP_STREAM=1)
+13:13:49 BOOT-B ready (pid 202501)
+13:13:49 START em2-soak-halves
+14:14:07 DONE em2-soak-halves exit=1
+14:14:07 CAMPAIGN2-COMPLETE
