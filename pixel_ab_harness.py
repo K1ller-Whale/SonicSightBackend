@@ -66,10 +66,10 @@ def extract(video, start, seconds, tmp):
          "-t", str(seconds), "-ac", "1", "-ar", str(AUD_RATE), wav],
         check=True,
     )
-    frames = sorted(
+    frames = [
         Image.open(os.path.join(tmp, f)).convert("RGB")
-        for f in os.listdir(tmp) if f.startswith("f_")
-    )
+        for f in sorted(os.listdir(tmp)) if f.startswith("f_")
+    ]
     audio, _ = sf.read(wav, dtype="float32")
     return frames, audio
 
@@ -183,6 +183,14 @@ def main():
             phase=feats["phase"], audio_gain=feats["audio_gain"],
             start_sample=0, center_timestamp_ms=0,
         )
+        # ── B2 first: both cell maps, and the energy map ONTO the cache —
+        # the live server always sets cache.energy_map before any query
+        # (grpc_server ~802), so every synthesize_regions listen below must
+        # run the same energy-ranked, contrast-gated conditioning production
+        # serves, not the map-less fallback (review finding).
+        energy, activation, _ = cell_analysis(inference, cache)
+        cache.energy_map = energy
+
         lm, rm = halves_region_masks()
         wavs, energies = synthesize_regions(
             inference, cache, [torch.from_numpy(lm), torch.from_numpy(rm)]
@@ -190,8 +198,6 @@ def main():
         sf.write(os.path.join(arg.out, "B_left.wav"), wavs[0], AUD_RATE)
         sf.write(os.path.join(arg.out, "B_right.wav"), wavs[1], AUD_RATE)
 
-        # ── B2: both cell maps ──
-        energy, activation, _ = cell_analysis(inference, cache)
         np.save(os.path.join(arg.out, "energy_map.npy"), energy)
         np.save(os.path.join(arg.out, "activation_map.npy"), activation)
         save_map_png(energy, os.path.join(arg.out, "energy_map.png"))

@@ -634,6 +634,9 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
         # region's audio (synthesized fresh per window, OLA-stitched) instead
         # of the mixture — live listening to a spot, not a replay.
         sticky_weights = None
+        # Mask-EMA state across the followed windows (PIXEL_STICKY_SMOOTH);
+        # reset whenever the followed region changes or the follow ends.
+        sticky_ema = {}
 
         try:
             async for chunk in request_iterator:
@@ -679,6 +682,7 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
 
                 if chunk.clear_sticky:
                     sticky_weights = None
+                    sticky_ema = {}
 
                 # ── Answer queries against the cache (no inference) ──
                 pixel_answers = []
@@ -687,6 +691,7 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                         # Sets/replaces the followed region; no one-shot
                         # answer — the live stream itself becomes the answer.
                         sticky_weights = region_disc(q.x_norm, q.y_norm, q.radius_norm)
+                        sticky_ema = {}  # new region: no stale mask history
                         continue
                     if i >= MAX_QUERIES:
                         pixel_answers.append(sonicsight_pb2.PixelAudio(
@@ -816,6 +821,7 @@ class SonicSightServicer(sonicsight_pb2_grpc.SonicSightServiceServicer):
                                     cache,
                                     [torch.from_numpy(sticky_weights),
                                      1.0 - torch.from_numpy(sticky_weights)],
+                                    ema=sticky_ema,  # mask EMA across windows
                                 )
                             window_audio_out = sticky_wavs[0]
 

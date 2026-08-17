@@ -118,7 +118,11 @@ def test_renorm_happens_in_linear_domain_after_unwarp(engine, cache):
 
     w = torch.from_numpy(region_disc(0.25, 0.25, 0.2))
     regions = [w, 1.0 - w]
-    wavs, _ = synthesize_regions(engine, cache, regions, binary=False)
+    # Legacy conditioning so the hand-built reference below stays valid; the
+    # unwarp->renorm ordering under test is shared by both conditioning modes.
+    wavs, _ = synthesize_regions(
+        engine, cache, regions, binary=False, conditioning="feature_maxpool"
+    )
 
     # Independent reference computed the deployed way.
     with torch.inference_mode():
@@ -164,6 +168,69 @@ def test_mask_renorm_flag_is_honored(engine, cache, monkeypatch):
     )
 
 
+def test_tap_binary_default_env_controls_mask_variant(engine, cache, monkeypatch):
+    """binary=None must resolve to PIXEL_TAP_BINARY (pixel-path default,
+    measured decision 2026-08-15: ratio taps leak — cello tap corr(region,
+    complement)=0.989 — binary taps separate cleanly), not the halves-shared
+    BINARY_MASK."""
+    import pixel_cache as pc
+    w = torch.from_numpy(region_disc(0.5, 0.5, 0.2))
+    explicit_bin, _ = synthesize_regions(engine, cache, [w, 1.0 - w], binary=True)
+    explicit_soft, _ = synthesize_regions(engine, cache, [w, 1.0 - w], binary=False)
+
+    monkeypatch.setattr(pc, "PIXEL_TAP_BINARY", 1)
+    default_on, _ = synthesize_regions(engine, cache, [w, 1.0 - w])
+    assert np.allclose(default_on[0], explicit_bin[0], atol=1e-6)
+
+    monkeypatch.setattr(pc, "PIXEL_TAP_BINARY", 0)
+    default_off, _ = synthesize_regions(engine, cache, [w, 1.0 - w])
+    assert np.allclose(default_off[0], explicit_soft[0], atol=1e-6)
+
+
+def test_sticky_ema_smooths_masks_across_windows(engine, cache, monkeypatch):
+    """The sticky mask-EMA lever (OFF by default — measured no benefit on
+    canon_d; see config): when enabled, an ema dict carried across calls
+    must smooth the linear-domain masks pre-renorm, mirroring the halves
+    MASK_SMOOTH order (unwarp -> EMA -> renorm -> binary)."""
+    import pixel_cache as pc
+    monkeypatch.setattr(pc, "PIXEL_STICKY_SMOOTH", 0.3)
+    w = torch.from_numpy(region_disc(0.3, 0.4, 0.15))
+
+    # Second window with different sound features -> different raw masks.
+    torch.manual_seed(23)
+    cache2 = WindowCache(
+        window_id=2,
+        feat_sound=torch.randn(1, K, 256, 256) * 0.5,
+        feats_img=cache.feats_img,
+        mag_lin=cache.mag_lin,
+        phase=cache.phase,
+        audio_gain=cache.audio_gain,
+        start_sample=0,
+        center_timestamp_ms=1125,
+    )
+
+    stateless2, _ = synthesize_regions(engine, cache2, [w, 1.0 - w], binary=False)
+
+    ema = {}
+    first, _ = synthesize_regions(engine, cache, [w, 1.0 - w], binary=False, ema=ema)
+    stateless1, _ = synthesize_regions(engine, cache, [w, 1.0 - w], binary=False)
+    # First call seeds the state: output identical to stateless.
+    assert np.allclose(first[0], stateless1[0], atol=1e-6)
+    assert "m" in ema
+
+    smoothed2, _ = synthesize_regions(engine, cache2, [w, 1.0 - w], binary=False, ema=ema)
+    # Second window's smoothed output must differ from its stateless output
+    # (history pulls it back toward window 1)...
+    assert not np.allclose(smoothed2[0], stateless2[0], atol=1e-5)
+    # ...and partition must still hold exactly (renorm runs after the EMA).
+    mix_ref = torch.istft(
+        torch.polar(cache2.mag_lin, cache2.phase),
+        n_fft=STFT_FRAME, hop_length=STFT_HOP,
+        window=engine.hann_window, length=AUD_LEN,
+    ) / cache2.audio_gain
+    assert np.allclose(smoothed2[0] + smoothed2[1], mix_ref.numpy(), atol=2e-4)
+
+
 def test_no_grad_graph_on_outputs(engine, cache):
     # net_synth params require grad; without the inference_mode guard these
     # calls would silently build autograd graphs (review finding).
@@ -192,6 +259,97 @@ def test_binary_full_region_returns_the_mixture(engine, cache):
         window=engine.hann_window, length=AUD_LEN,
     ) / cache.audio_gain
     assert np.allclose(wavs[0], np.clip(mix_ref.numpy(), -1, 1), atol=2e-4)
+
+
+# ---------------------------------------------------------------------------
+# Region conditioning selectivity (the long-press "both instruments" bug)
+# ---------------------------------------------------------------------------
+
+class _TwoChanEngine:
+    """Real InnerProd, 2 channels, identity scale — masks are readable by hand."""
+
+    def __init__(self):
+        self.net_synth = InnerProd(fc_dim=2)
+        with torch.no_grad():
+            self.net_synth.scale.copy_(torch.ones(2))
+            self.net_synth.bias.copy_(torch.tensor([0.0]))
+        self.grid_unwarp = torch.from_numpy(warpgrid(1, 512, 256, warp=False))
+        self.hann_window = torch.hann_window(STFT_FRAME)
+
+
+def _two_instrument_setup():
+    """Synthetic scene mirroring the live failure: two spectrally disjoint
+    instruments at known cells, plus a heterogeneous leaky background whose
+    per-channel maxima saturate a whole-frame feature max-pool (the measured
+    live condition: every cell claims 30-60% of peak energy)."""
+    torch.manual_seed(3)
+    engine = _TwoChanEngine()
+
+    # Sound features: channel 0 votes +4 logits for the low warped band,
+    # channel 1 for the high band.
+    feat_sound = torch.empty(1, 2, 256, 256)
+    feat_sound[0, 0, :128, :] = 4.0
+    feat_sound[0, 0, 128:, :] = -4.0
+    feat_sound[0, 1] = -feat_sound[0, 0]
+
+    # Vision features: instrument A at (2,2) purely ch0, B at (11,11) purely
+    # ch1; background cells carry BOTH channels at 0.3-0.9, so max-pooling
+    # 191 of them saturates both channels.
+    feats_img = torch.rand(1, 2, GRID_H, GRID_W) * 0.6 + 0.3
+    feats_img[0, :, 2, 2] = torch.tensor([1.0, 0.0])
+    feats_img[0, :, 11, 11] = torch.tensor([0.0, 1.0])
+
+    y = torch.randn(AUD_LEN) * 0.1
+    stft = torch.stft(
+        y, n_fft=STFT_FRAME, hop_length=STFT_HOP,
+        window=torch.hann_window(STFT_FRAME), return_complex=True,
+    )[:512, :256]
+    cache = WindowCache(
+        window_id=1,
+        feat_sound=feat_sound,
+        feats_img=feats_img,
+        mag_lin=torch.ones(512, 256),
+        phase=stft.angle().float(),
+        audio_gain=1.0,
+        start_sample=0,
+        center_timestamp_ms=0,
+    )
+    # Energy map as the live server always provides it before any query:
+    # instruments are the peaks, background at the measured ~30% floor.
+    em = np.full((GRID_H, GRID_W), 3.0, dtype=np.float32)
+    em[2, 2] = 10.0
+    em[11, 11] = 10.0
+    cache.energy_map = em
+    return engine, cache
+
+
+def _band_energies(wav, engine):
+    """Energy of a track split into instrument A's vs B's linear-domain rows."""
+    import torch.nn.functional as F
+
+    band = torch.zeros(1, 1, 256, 256)
+    band[:, :, :128, :] = 1.0
+    lin = F.grid_sample(band, engine.grid_unwarp, align_corners=True).squeeze()
+    a_rows = lin.mean(dim=1) > 0.5
+    s = torch.stft(
+        torch.from_numpy(wav), n_fft=STFT_FRAME, hop_length=STFT_HOP,
+        window=engine.hann_window, return_complex=True,
+    )[:512, :256].abs()
+    e = s ** 2
+    return float(e[a_rows].sum()), float(e[~a_rows].sum())
+
+
+def test_long_press_region_suppresses_the_other_instrument():
+    """A tap on instrument A must not play a mildly re-weighted mixture:
+    conditioning each region on its most sound-active CELL MASKS (the
+    deployed halves recipe) has to suppress instrument B by a clear margin."""
+    engine, cache = _two_instrument_setup()
+    w = torch.from_numpy(region_disc(2.5 / GRID_W, 2.5 / GRID_H, 1.0 / GRID_W))
+    wavs, _ = synthesize_regions(engine, cache, [w, 1.0 - w], binary=False)
+    e_a, e_b = _band_energies(wavs[0], engine)
+    assert e_a / max(e_b, 1e-12) >= 4.0, (
+        f"tap on A keeps too much of B: E_A/E_B = {e_a / max(e_b, 1e-12):.2f}"
+    )
 
 
 # ---------------------------------------------------------------------------

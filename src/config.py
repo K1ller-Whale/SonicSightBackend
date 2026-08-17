@@ -68,6 +68,44 @@ SEPARATION_MODE = os.environ.get("SONICSIGHT_SEPARATION_MODE", "video")
 # 4-8 = robust average over the instrument region (recommended)
 SEP_TOPK = int(os.environ.get("SONICSIGHT_SEP_TOPK", "4"))
 
+# --- PIXEL-MODE REGION CONDITIONING (pixel_cache.synthesize_regions) ---
+# "mask_topk"       : a region's mask is the energy-weighted average of its
+#                     most sound-active CELL masks — the same fix applied to
+#                     the halves path above, restricted to the region. A
+#                     max-pooled complement feature vector saturates (191 of
+#                     196 post-sigmoid cells), which made a long-press play a
+#                     mildly re-weighted mixture: both instruments audible.
+# "feature_maxpool" : legacy — one mask from a max-pooled region feature
+#                     vector (kept for A/B listening via pixel_ab_harness).
+REGION_CONDITIONING = os.environ.get("SONICSIGHT_REGION_CONDITIONING", "mask_topk")
+
+# Verbose per-query/per-window pixel diagnostics (cell choices, gate
+# threshold, mask statistics). Costs a few host syncs and log lines per
+# synthesis — debugging sessions only.
+PIXEL_DEBUG = int(os.environ.get("SONICSIGHT_PIXEL_DEBUG", "0"))
+
+# Default mask variant for pixel-path region synthesis (the deferred B1
+# decision, resolved by measurement on canon_d.mp4 2026-08-15, real ckpt):
+# soft ratio taps leak — a cello tap's region correlated 0.989 with its own
+# complement (the complement's top-energy cells are the same instrument, so
+# renorm flattens); binary taps separated cleanly (guitar tap corr vs
+# A_left/right 0.553/0.047, cello tap 0.165/0.932). Pixel-only: the halves
+# path keeps its own BINARY_MASK gate.
+PIXEL_TAP_BINARY = int(os.environ.get("SONICSIGHT_PIXEL_TAP_BINARY", "1"))
+
+# EMA weight for the NEW mask in sticky-follow synthesis (1.0 = off).
+# Rationale mirrors halves MASK_SMOOTH (unwarp -> EMA -> renorm -> binary):
+# sticky windows overlap 97.9% but masks are computed independently, and
+# under the binary default the renormed ratio rides the 0.5 threshold —
+# independent per-window masks flip bins wholesale. Measured on canon_d
+# (2026-08-16, 48 consecutive hop windows, cello follow): 18.6% of ALL
+# spectrogram bins flip per 125 ms window without smoothing (max 44%) —
+# heard live as robotic/static (log 2026-08-15: raw region/complement
+# cos 0.97-0.99, knife-edge). EMA 0.3 cuts the flip rate to 7.2% mean.
+# (Track-level rms is NOT the metric — those swings are the music's own
+# dynamics and EMA rightly leaves them alone.)
+PIXEL_STICKY_SMOOTH = float(os.environ.get("SONICSIGHT_PIXEL_STICKY_SMOOTH", "0.3"))
+
 # --- MASK TEMPORAL SMOOTHING ---
 # Consecutive streaming windows overlap by 97.9% (hop 1378 of 65536 samples),
 # so their masks SHOULD be nearly identical. They are computed independently

@@ -21,11 +21,15 @@ import torch.nn.functional as F
 
 from config import (
     AUD_LEN,
-    BINARY_MASK,
     MASK_RENORM,
     MASK_RENORM_EPS,
     MASK_RENORM_FLOOR,
     MASK_THRES,
+    PIXEL_DEBUG,
+    PIXEL_STICKY_SMOOTH,
+    PIXEL_TAP_BINARY,
+    REGION_CONDITIONING,
+    SEP_TOPK,
     STFT_FRAME,
     STFT_HOP,
 )
@@ -161,7 +165,13 @@ def region_disc(x_norm: float, y_norm: float, radius_norm: float,
 
 
 def _pool_region_vector(feats_img: torch.Tensor, weights: torch.Tensor) -> Optional[torch.Tensor]:
-    """Max-pool the K-vectors over the region's support. None = empty region."""
+    """Max-pool the K-vectors over the region's support. None = empty region.
+
+    Legacy conditioning ("feature_maxpool"): over a large support (the
+    complement of a tap is ~191 cells) the per-channel max of post-sigmoid
+    features saturates, so the synthesized mask stops discriminating — the
+    failure documented for the halves path in inference.py (SEPARATION_MODE
+    comment) and the reason a long-press played both instruments."""
     support = weights > REGION_SUPPORT_THRESHOLD
     if not bool(support.any()):
         return None
@@ -169,27 +179,119 @@ def _pool_region_vector(feats_img: torch.Tensor, weights: torch.Tensor) -> Optio
     return cells.amax(dim=1, keepdim=True).T  # [1, K]
 
 
+def _cell_masks(engine, cache: WindowCache, cell_idx: torch.Tensor,
+                chunk: int = 28) -> torch.Tensor:
+    """Sigmoid masks for a set of grid cells, chunked like cell_analysis.
+    cell_idx: [n] flat indices into the GRID_H*GRID_W grid. -> [n, 1, 256, 256]."""
+    K = cache.feats_img.shape[1]
+    vecs = cache.feats_img[0].reshape(K, GRID_H * GRID_W).T  # [196, K]
+    v = vecs[cell_idx]
+    out = []
+    for lo in range(0, v.shape[0], chunk):
+        hi = min(lo + chunk, v.shape[0])
+        fs = cache.feat_sound.expand(hi - lo, -1, -1, -1)
+        out.append(torch.sigmoid(engine.net_synth(v[lo:hi], fs)))
+    return torch.cat(out, dim=0)
+
+
+def _region_mask_from_cells(engine, cache: WindowCache, weights: torch.Tensor,
+                            topk: int = None) -> Optional[torch.Tensor]:
+    """Region mask = weighted average of the region's most sound-active CELL
+    masks — the deployed halves recipe (inference.py SEPARATION_MODE="pixel",
+    top-K by activation, weighted mask average) restricted to a region.
+
+    Cells are ranked by the cached linear-domain energy map (the quantity
+    that matches what plays); the live server always fills cache.energy_map
+    before any query is served. Offline callers without an energy map fall
+    back to ranking by each candidate mask's own mean activation — the exact
+    halves criterion, at the cost of synthesizing every support cell's mask.
+    Returns [1, 1, 256, 256], or None for an empty region."""
+    if topk is None:
+        topk = SEP_TOPK
+    support = weights > REGION_SUPPORT_THRESHOLD
+    if not bool(support.any()):
+        return None
+    idx = support.reshape(-1).nonzero(as_tuple=False).squeeze(1)
+    if cache.energy_map is not None:
+        from clustering import silence_threshold  # lazy: clustering imports this module
+
+        flat = cache.energy_map.reshape(-1)
+        scores = torch.as_tensor(flat, dtype=torch.float32, device=idx.device)[idx]
+        # Contrast-gate first (the server's honest-silence gate): keep only
+        # the region's SOUNDING cells. Without this, energy-tied background
+        # cells inside the top-K dilute the average back toward the leaky
+        # mixture the fix exists to suppress (measured in the RED test:
+        # E_A/E_B 1.44 gateless vs >4 gated).
+        thr = silence_threshold(flat)
+        sounding = scores > thr
+        if bool(sounding.any()):
+            idx = idx[sounding]
+            scores = scores[sounding]
+        k = int(max(1, min(topk, idx.numel())))
+        top = scores.topk(k).indices
+        m = _cell_masks(engine, cache, idx[top])   # only the K chosen synths
+        sel = scores[top]
+        if PIXEL_DEBUG:
+            chosen = [
+                (int(i) // GRID_W, int(i) % GRID_W, round(float(s), 3))
+                for i, s in zip(idx[top].tolist(), sel.tolist())
+            ]
+            logger.info(
+                "pixel dbg: region support=%d sounding=%d thr=%.3g chosen(row,col,energy)=%s",
+                int(support.sum()), int(sounding.sum()), thr, chosen,
+            )
+    else:
+        k = int(max(1, min(topk, idx.numel())))
+        m = _cell_masks(engine, cache, idx)
+        acts = m.mean(dim=(1, 2, 3))
+        top = acts.topk(k).indices
+        m = m[top]
+        sel = acts[top]
+    sel = sel.to(device=m.device, dtype=m.dtype)
+    total = float(sel.sum())
+    if total <= 0.0:
+        w = torch.full_like(sel, 1.0 / sel.numel())  # silent window: plain mean
+    else:
+        w = sel
+    return (m * w.view(-1, 1, 1, 1)).sum(dim=0, keepdim=True)
+
+
 def synthesize_regions(engine, cache: WindowCache, regions: List[torch.Tensor],
-                       binary: Optional[bool] = None):
+                       binary: Optional[bool] = None,
+                       conditioning: Optional[str] = None,
+                       ema: Optional[dict] = None):
     """The primitive: N region-weight maps -> N PCM tracks + linear energies.
 
-    Pool each region's K-vector FIRST (max over support), synthesize ONE mask
-    per region via InnerProd, then post-process in the DEPLOYED halves order
-    (inference.py ~1156-1203): unwarp to the linear 512-bin domain FIRST, then
-    renorm across the N masks together (gated on MASK_RENORM, divisor clamped
-    at max(MASK_RENORM_FLOOR, MASK_RENORM_EPS)), then optional binary — all in
-    the linear domain. Renorm/binary do NOT commute with the bilinear unwarp,
-    so doing them pre-unwarp would silently diverge from the streamed halves
-    math (caught in review; verified up to 0.54 absolute mask error).
+    Build ONE mask per region FIRST — by default ("mask_topk", config
+    REGION_CONDITIONING) the energy-weighted average of the region's top-K
+    cell masks (_region_mask_from_cells); "feature_maxpool" keeps the legacy
+    pooled-feature-vector conditioning for A/B listening. Then post-process
+    in the DEPLOYED halves order (inference.py ~1156-1203): unwarp to the
+    linear 512-bin domain FIRST, then renorm across the N masks together
+    (gated on MASK_RENORM, divisor clamped at max(MASK_RENORM_FLOOR,
+    MASK_RENORM_EPS)), then optional binary — all in the linear domain.
+    Renorm/binary do NOT commute with the bilinear unwarp, so doing them
+    pre-unwarp would silently diverge from the streamed halves math (caught
+    in review; verified up to 0.54 absolute mask error).
     The renormed set partitions the mixture: faders sum back to the original;
     a single tap passes [region, complement].
 
     Returns (list of float32 [AUD_LEN] arrays, list of float energies).
     Empty-support regions return silence with energy 0 (an honest "nothing
     here", not a globally-biased mask).
+
+    ema: optional mutable dict carried by a sticky-follow caller across
+    windows. The linear-domain masks are EMA-smoothed against ema["m"]
+    (weight PIXEL_STICKY_SMOOTH for the new mask) BEFORE renorm/binary —
+    the halves MASK_SMOOTH ordering — and the state is written back. Shape
+    or region-count changes reset the state. One-shot callers pass None.
     """
     if binary is None:
-        binary = bool(BINARY_MASK)
+        # Pixel-path default is BINARY (config.PIXEL_TAP_BINARY, measured
+        # decision — see config comment); BINARY_MASK stays the halves knob.
+        binary = bool(PIXEL_TAP_BINARY)
+    if conditioning is None:
+        conditioning = REGION_CONDITIONING
 
     with torch.inference_mode():
         device = cache.feat_sound.device
@@ -197,13 +299,19 @@ def synthesize_regions(engine, cache: WindowCache, regions: List[torch.Tensor],
         empty_flags = []
         for w in regions:
             wt = torch.as_tensor(w, dtype=torch.float32, device=device)
-            vec = _pool_region_vector(cache.feats_img, wt)
-            if vec is None:
+            if conditioning == "feature_maxpool":
+                vec = _pool_region_vector(cache.feats_img, wt)
+                m = None
+                if vec is not None:
+                    z = engine.net_synth(vec, cache.feat_sound)  # [1, 1, 256, 256] logits
+                    m = torch.sigmoid(z)
+            else:
+                m = _region_mask_from_cells(engine, cache, wt)
+            if m is None:
                 masks.append(torch.zeros(1, 1, 256, 256, device=device))
                 empty_flags.append(True)
                 continue
-            z = engine.net_synth(vec, cache.feat_sound)   # [1, 1, 256, 256] logits
-            masks.append(torch.sigmoid(z))
+            masks.append(m)
             empty_flags.append(False)
 
         m = torch.cat(masks, dim=0)  # [N, 1, 256, 256], warped domain
@@ -212,6 +320,30 @@ def synthesize_regions(engine, cache: WindowCache, regions: List[torch.Tensor],
         #    engine's existing 512-bin grid.
         grid = engine.grid_unwarp.to(device=device, dtype=m.dtype).expand(m.size(0), -1, -1, -1)
         m_lin = F.grid_sample(m, grid, align_corners=True).squeeze(1)  # [N, 512, 256]
+
+        # Sticky-follow temporal smoothing: EMA the linear masks against the
+        # caller-held state pre-renorm (halves MASK_SMOOTH order). Binary's
+        # threshold cliff turns independent per-window masks into audible
+        # stutter without this.
+        if ema is not None and 0.0 < PIXEL_STICKY_SMOOTH < 1.0:
+            prev = ema.get("m")
+            if prev is not None and prev.shape == m_lin.shape:
+                m_lin = PIXEL_STICKY_SMOOTH * m_lin + (1.0 - PIXEL_STICKY_SMOOTH) * prev
+            ema["m"] = m_lin.detach().clone()
+
+        # Discrimination probe: raw (pre-renorm) cosine between the first two
+        # tracks' masks. ~1.0 means the synthesizer produced near-identical
+        # masks for region and complement — conditioning is not
+        # discriminating and no downstream math can separate the tracks.
+        if PIXEL_DEBUG and m_lin.size(0) >= 2 and not (empty_flags[0] or empty_flags[1]):
+            cos_raw = F.cosine_similarity(
+                m_lin[0].flatten(), m_lin[1].flatten(), dim=0
+            )
+            logger.info(
+                "pixel dbg: raw mask means=%s cos(m0,m1)=%.4f",
+                [round(float(x), 3) for x in m_lin.mean(dim=(1, 2)).tolist()],
+                float(cos_raw),
+            )
 
         # 2) Renorm across the region set in the LINEAR domain, honoring the
         #    same config gates as the halves path. Empty regions stay zero.

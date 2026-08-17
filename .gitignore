@@ -2,8 +2,15 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-**/ckpt/*.pth
+**/ckpt/
 **/outputs/*/
 **/testing_model/*/
 /diag5_audio/
 *.txt
+*.wav 
+*.png
+ab_cello 
+ab_guitar
+data
+demo
+tools/
